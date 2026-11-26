@@ -448,6 +448,31 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   bool debug_markers_enabled_ = false;
 
+  /** gpu.d3d12.pass_timing: a timestamp at each guest pass boundary, summed per pass label. */
+  void PassTimingBoundary(const char* label);
+  void PassTimingEndSubmission();
+  void PassTimingCollect();
+  static constexpr u32 kPassTimingQueryCount = 32768;
+  bool pass_timing_enabled_ = false;
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> pass_timing_query_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> pass_timing_readback_;
+  u64 pass_timing_frequency_ = 0;
+  u32 pass_timing_next_query_ = 0;
+  u32 pass_timing_submission_first_query_ = 0;
+  u64 pass_timing_key_ = UINT64_MAX;
+  std::vector<u32> pass_timing_labels_;  // label index of each segment of the open submission
+  struct PassTimingSubmission {
+    u64 submission;
+    u32 first_query;
+    std::vector<u32> labels;
+  };
+  std::deque<PassTimingSubmission> pass_timing_pending_;
+  std::vector<std::string> pass_timing_label_names_;
+  std::unordered_map<std::string, u32> pass_timing_label_index_;
+  std::vector<std::pair<f64, u64>> pass_timing_totals_;  // ms and count per label
+  u64 pass_timing_frames_ = 0;
+  u64 pass_timing_window_start_ms_ = 0;
+
   /** Skips GetHostViewport when the affecting registers are unchanged. */
   struct ViewportCacheKey {
     u32 pa_cl_clip_cntl;

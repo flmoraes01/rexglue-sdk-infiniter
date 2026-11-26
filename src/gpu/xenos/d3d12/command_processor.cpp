@@ -11,6 +11,8 @@
 
 #include <bit>
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -832,6 +834,27 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_FAIL(false,
                 "Failed to create the fence for awaiting queue operations done since "
                 "the latest submission");
+  }
+
+  pass_timing_enabled_ = GetD3D12Settings().pass_timing.Get();
+  if (pass_timing_enabled_) {
+    D3D12_QUERY_HEAP_DESC query_heap_desc = {};
+    query_heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    query_heap_desc.Count = kPassTimingQueryCount;
+    D3D12_RESOURCE_DESC readback_desc;
+    gpu::d3d12::objects::FillBufferResourceDesc(
+        readback_desc, sizeof(u64) * kPassTimingQueryCount, D3D12_RESOURCE_FLAG_NONE);
+    if (FAILED(device->CreateQueryHeap(&query_heap_desc,
+                                       IID_PPV_ARGS(&pass_timing_query_heap_))) ||
+        FAILED(device->CreateCommittedResource(
+            &gpu::d3d12::objects::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &readback_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&pass_timing_readback_))) ||
+        FAILED(provider.GetDirectQueue()->GetTimestampFrequency(&pass_timing_frequency_))) {
+      REXGPU_WARN("gpu.d3d12.pass_timing: could not create the timestamp resources");
+      pass_timing_enabled_ = false;
+    } else {
+      REXGPU_INFO("gpu.d3d12.pass_timing: logging GPU time per guest pass every 2 s");
+    }
   }
 
   ID3D12CommandAllocator* command_allocator;
@@ -2236,6 +2259,27 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
   u32 normalized_color_mask =
       pixel_shader ? draw_state::GetNormalizedColorMask(regs, pixel_shader->GetWritesColorTargets())
                    : 0;
+  if (pass_timing_enabled_) {
+    const auto surface_info = regs.Get<xenos::reg::RB_SURFACE_INFO>();
+    const auto depth_info = regs.Get<xenos::reg::RB_DEPTH_INFO>();
+    const auto color_info = regs.Get<xenos::reg::RB_COLOR_INFO>(
+        xenos::reg::RB_COLOR_INFO::kRTRegisterIndices[0]);
+    const bool depth_used =
+        normalized_depth_control.z_enable || normalized_depth_control.stencil_enable;
+    const u64 key = u64{surface_info.value & 0x3FFFF} |
+                    (u64{color_info.value & 0xFFFFF} << 18) |
+                    (u64{normalized_color_mask & 0xF} << 38) |
+                    (u64{depth_used ? (depth_info.value & 0x1FFFF) : 0x1FFFF} << 42);
+    if (key != pass_timing_key_) {
+      pass_timing_key_ = key;
+      char label[160];
+      std::snprintf(label, sizeof(label), "draw pitch %u msaa %u rt-mask %X c0 fmt %u @%u%s",
+                    surface_info.surface_pitch, static_cast<u32>(surface_info.msaa_samples),
+                    normalized_color_mask & 0xF, static_cast<u32>(color_info.color_format),
+                    color_info.color_base, depth_used ? " +depth" : "");
+      PassTimingBoundary(label);
+    }
+  }
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return false;
@@ -2714,12 +2758,114 @@ bool D3D12CommandProcessor::IssueDrawMemexportReadbackFastPath(u32 total_size) {
   return true;
 }
 
+void D3D12CommandProcessor::PassTimingBoundary(const char* label) {
+  // Keep a query for the final stamp of the submission.
+  if (!submission_open_ || pass_timing_next_query_ + 2 >= kPassTimingQueryCount) {
+    return;
+  }
+  auto [it, inserted] = pass_timing_label_index_.try_emplace(
+      label, static_cast<u32>(pass_timing_label_names_.size()));
+  if (inserted) {
+    pass_timing_label_names_.emplace_back(label);
+    pass_timing_totals_.emplace_back(0.0, 0);
+  }
+  deferred_command_list_.D3DEndQuery(pass_timing_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                     pass_timing_next_query_++);
+  pass_timing_labels_.push_back(it->second);
+}
+
+void D3D12CommandProcessor::PassTimingEndSubmission() {
+  pass_timing_key_ = UINT64_MAX;
+  if (pass_timing_labels_.empty()) {
+    return;
+  }
+  const u32 first = pass_timing_submission_first_query_;
+  deferred_command_list_.D3DEndQuery(pass_timing_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                     pass_timing_next_query_++);
+  const u32 count = pass_timing_next_query_ - first;
+  deferred_command_list_.D3DResolveQueryData(pass_timing_query_heap_.Get(),
+                                             D3D12_QUERY_TYPE_TIMESTAMP, first, count,
+                                             pass_timing_readback_.Get(), sizeof(u64) * first);
+  pass_timing_pending_.push_back({submission_current_, first, std::move(pass_timing_labels_)});
+  pass_timing_labels_.clear();
+  // Wrap while plenty of the ring is left for the submissions the GPU may still be reading.
+  if (pass_timing_next_query_ > kPassTimingQueryCount / 2) {
+    pass_timing_next_query_ = 0;
+  }
+  pass_timing_submission_first_query_ = pass_timing_next_query_;
+}
+
+void D3D12CommandProcessor::PassTimingCollect() {
+  const u64 completed = submission_fence_->GetCompletedValue();
+  while (!pass_timing_pending_.empty() && pass_timing_pending_.front().submission <= completed) {
+    const PassTimingSubmission& done = pass_timing_pending_.front();
+    const size_t count = done.labels.size() + 1;
+    const D3D12_RANGE range{sizeof(u64) * done.first_query,
+                            sizeof(u64) * (done.first_query + count)};
+    u64* stamps = nullptr;
+    if (SUCCEEDED(pass_timing_readback_->Map(0, &range, reinterpret_cast<void**>(&stamps)))) {
+      const u64* first = stamps + done.first_query;
+      for (size_t i = 0; i < done.labels.size(); ++i) {
+        if (first[i + 1] >= first[i]) {
+          auto& total = pass_timing_totals_[done.labels[i]];
+          total.first += static_cast<f64>(first[i + 1] - first[i]) * 1000.0 /
+                         static_cast<f64>(pass_timing_frequency_);
+          ++total.second;
+        }
+      }
+      const D3D12_RANGE written{0, 0};
+      pass_timing_readback_->Unmap(0, &written);
+    }
+    pass_timing_pending_.pop_front();
+  }
+  const u64 now_ms = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count());
+  if (pass_timing_window_start_ms_ == 0) {
+    pass_timing_window_start_ms_ = now_ms;
+    pass_timing_frames_ = 0;
+    return;
+  }
+  if (now_ms - pass_timing_window_start_ms_ < 2000 || pass_timing_frames_ == 0) {
+    return;
+  }
+  std::vector<u32> order(pass_timing_totals_.size());
+  f64 sum = 0.0;
+  for (u32 i = 0; i < order.size(); ++i) {
+    order[i] = i;
+    sum += pass_timing_totals_[i].first;
+  }
+  std::sort(order.begin(), order.end(), [this](u32 a, u32 b) {
+    return pass_timing_totals_[a].first > pass_timing_totals_[b].first;
+  });
+  const f64 frames = static_cast<f64>(pass_timing_frames_);
+  REXGPU_INFO("pass_timing: {:.0f} frames, measured GPU time {:.2f} ms/frame", frames,
+              sum / frames);
+  for (size_t i = 0; i < order.size() && i < 12; ++i) {
+    const auto& total = pass_timing_totals_[order[i]];
+    if (total.first <= 0.0) {
+      break;
+    }
+    REXGPU_INFO("pass_timing:  {:6.2f} ms/frame {:5.1f} passes/frame  {}", total.first / frames,
+                static_cast<f64>(total.second) / frames, pass_timing_label_names_[order[i]]);
+  }
+  for (auto& total : pass_timing_totals_) {
+    total = {0.0, 0};
+  }
+  pass_timing_frames_ = 0;
+  pass_timing_window_start_ms_ = now_ms;
+}
+
 bool D3D12CommandProcessor::IssueCopy() {
 #if REXGPU_FINE_GRAINED_DRAW_SCOPES
   REX_PROFILE_SCOPE("gpu");
 #endif  // REXGPU_FINE_GRAINED_DRAW_SCOPES
   if (!BeginSubmission(true)) {
     return false;
+  }
+  if (pass_timing_enabled_) {
+    PassTimingBoundary("resolve");
+    pass_timing_key_ = UINT64_MAX;  // the next draw opens a new pass
   }
   ReadbackResolveMode readback_mode =
       GetReadbackResolveMode(GetD3D12Settings().readback_resolve.Get());
@@ -3233,6 +3379,10 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
 
     pipeline_cache_->EndSubmission();
 
+    if (pass_timing_enabled_) {
+      PassTimingEndSubmission();
+    }
+
     // Resources with queued barriers may be destroyed between frames, so submit barriers now.
     SubmitBarriers();
 
@@ -3261,6 +3411,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     }
 
     direct_queue->Signal(submission_fence_, submission_current_++);
+    if (pass_timing_enabled_) {
+      PassTimingCollect();
+    }
 
     submission_open_ = false;
 
@@ -3273,6 +3426,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     }
     frame_open_ = false;
     closed_frame_submissions_[(frame_current_++) % kQueueFrames] = submission_current_ - 1;
+    ++pass_timing_frames_;
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;

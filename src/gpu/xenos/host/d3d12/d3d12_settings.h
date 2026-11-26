@@ -28,6 +28,10 @@ class D3D12Settings : public SettingOwner {
   REX_SETTING(bool, debug_markers, false,
               "Insert debug markers into GPU command streams for tools like PIX and RenderDoc. "
               "Turns on when RenderDoc is detected");
+  REX_SETTING(bool, pass_timing, false,
+              "Log the GPU time of each guest render pass (render target setup or resolve) every "
+              "2 seconds, for profiling",
+              kStartupOnly);
   REX_SETTING(bool, bindless, true, "Use bindless resources where available", kRestart);
   REX_SETTING(bool, readback_memexport, false,
               "Read data written by memory export in shaders on the CPU");
