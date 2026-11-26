@@ -19,6 +19,8 @@
 #include <rex/logging/log_category.h>
 #include <rex/math.h>
 #include "gpu/xenos/host/d3d12/d3d12_presenter.h"
+
+#include <rex/gpu/output_painter.h>
 #include "gpu/xenos/host/d3d12/d3d12_provider.h"
 #include "gpu/xenos/host/d3d12/d3d12_objects.h"
 #include <rex/utility.h>
@@ -394,6 +396,32 @@ Presenter::PaintResult D3D12Presenter::DriverPaintAndPresent(bool execute_ui_dra
       scissor.bottom = static_cast<LONG>(back_buffer_desc.Height);
       command_list->RSSetScissorRects(1, &scissor);
 
+      bool painted_by_hook = false;
+      if (gpu::IOutputPainter* painter = gpu::GetOutputPainter()) {
+        gpu::D3D12OutputPaint paint;
+        paint.command_list = command_list;
+        paint.source = guest_output_resource.Get();
+        paint.source_width = guest_output_properties.frontbuffer_width;
+        paint.source_height = guest_output_properties.frontbuffer_height;
+        paint.target = back_buffer;
+        paint.target_rtv = back_buffer_rtv.ptr;
+        paint.target_format = static_cast<u32>(back_buffer_desc.Format);
+        paint.output_x = guest_output_flow.output_x;
+        paint.output_y = guest_output_flow.output_y;
+        paint.output_width = guest_output_flow.effect_output_size.first;
+        paint.output_height = guest_output_flow.effect_output_size.second;
+        paint.submission = current_paint_submission;
+        paint.completed_submission =
+            paint_context_.paint_submission_tracker.GetCompletedSubmission();
+        painted_by_hook = painter->PaintD3D12(paint);
+        // The painter may have changed any state: restore what the presenter relies on.
+        command_list->SetDescriptorHeaps(1, &view_heap);
+        command_list->OMSetRenderTargets(1, &back_buffer_rtv, TRUE, nullptr);
+        command_list->RSSetViewports(1, &viewport);
+        command_list->RSSetScissorRects(1, &scissor);
+      }
+
+      if (!painted_by_hook) {
       command_list->SetPipelineState(
           guest_output_paint_pipelines_[static_cast<size_t>(effect)].Get());
       GuestOutputPaintRootSignatureIndex guest_output_paint_root_signature_index =
@@ -444,6 +472,7 @@ Presenter::PaintResult D3D12Presenter::DriverPaintAndPresent(bool execute_ui_dra
 
       command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
       command_list->DrawInstanced(4, 1, 0, 0);
+      }
 
       if (guest_output_flow.letterbox_clear_rectangle_count) {
         D3D12_RECT letterbox_clear_d3d12_rectangles[GuestOutputPaintFlow::kMaxClearRectangles];

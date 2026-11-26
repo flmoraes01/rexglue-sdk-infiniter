@@ -24,6 +24,7 @@ target_sources(
           log_sink.cpp
           logger.cpp
           module_group.cpp
+          output_painter.cpp
           path.cpp
           path_settings.cpp
           process_control.cpp
