@@ -165,7 +165,9 @@ Result<void> XenosGraphicsDriverBase::AttachTitle(const TitleInfo& info, IPhysic
     constexpr std::chrono::milliseconds kLongestSleep{50};
     u64 last_frame_time = Clock::QueryGuestTickCount();
     while (vsync_worker_running_) {
-      u64 interval_ticks = IsVSyncEnabled() ? vsync_interval_ticks : no_vsync_interval_ticks;
+      const bool fixed_vblank =
+          IsVSyncEnabled() || !vblank_follows_vsync.Get();
+      u64 interval_ticks = fixed_vblank ? vsync_interval_ticks : no_vsync_interval_ticks;
       DeliverVblanks(
           Clock::QueryGuestTickCount(), last_frame_time, interval_ticks, kMaxVblankCatchUp,
           [this] { MarkVblank(); }, [this] { return vsync_worker_running_.load(); });

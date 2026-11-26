@@ -24,6 +24,9 @@ class XenosSettings : public SettingOwner {
   REX_SETTING(i32, present_safe_area_x, 90, "Horizontal title safe area percent", Range{50, 100});
   REX_SETTING(i32, present_safe_area_y, 90, "Vertical title safe area percent", Range{50, 100});
   REX_SETTING(bool, present_dither, false, "Dither when presenting to an 8 bit swap chain");
+  REX_SETTING(bool, vblank_follows_vsync, true,
+              "Without gpu.vsync, deliver guest vblanks every 1 ms instead of at the video mode "
+              "refresh rate. Turn off for titles that count vblanks as time");
   REX_SETTING(bool, present_allow_overscan_cutoff, false, "Allow cutting off overscan");
   REX_SETTING(std::string, readback_resolve, "none",
               "Controls CPU readback of render to texture resolve results",
