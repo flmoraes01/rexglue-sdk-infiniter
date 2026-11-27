@@ -1081,9 +1081,15 @@ void DXBCShaderTranslator::CompletePixelShaderWriteToROV() {
 
   // The motion of the first sample once its depth test is known, while the address is its own.
   const bool write_motion = GetMotionRegisterCount() != 0;
+  const bool write_reactive = GetDXBCShaderModification().pixel.reactive_mask &&
+                              !is_depth_only_pixel_shader_ &&
+                              GetCurrentShader().IsColorTargetWritten(0);
   if (IsROVDepthStencilEarly()) {
     if (write_motion) {
       CompletePixelShaderWriteMotion();
+    }
+    if (write_reactive) {
+      CompletePixelShaderWriteReactive();
     }
     for (u32 i = 0; i < 4; ++i) {
       a_.OpAnd(temp_x_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
@@ -1110,6 +1116,9 @@ void DXBCShaderTranslator::CompletePixelShaderWriteToROV() {
     ROVDepthStencilTest();
     if (write_motion) {
       CompletePixelShaderWriteMotion();
+    }
+    if (write_reactive) {
+      CompletePixelShaderWriteReactive();
     }
   }
 
@@ -1513,8 +1522,11 @@ void DXBCShaderTranslator::CompletePixelShaderWriteMotion() {
                 dxbc::Src::LU(0x10000), dxbc::Src::R(ndc_temp, dxbc::Src::kXXXX));
     }
     a_.OpEndIf();
-    // Stored inverted, so zero (the initial and cleared value) means no motion.
+    // Stored inverted, so zero (the initial and cleared value) means no motion, and without the
+    // reactive bit: an opaque surface replaces what was drawn there.
     a_.OpNot(dxbc::Dest::R(temp, 0b0001), dxbc::Src::R(temp, dxbc::Src::kXXXX));
+    a_.OpAnd(dxbc::Dest::R(temp, 0b0001), dxbc::Src::R(temp, dxbc::Src::kXXXX),
+             dxbc::Src::LU(~UINT32_C(1)));
     // The motion region follows EDRAM, laid out like the depth buffer.
     const u32 edram_size_32bpp_samples =
         (xenos::kEDRAMTileHeightSamples * draw_resolution_scale_y_) *
@@ -1530,6 +1542,48 @@ void DXBCShaderTranslator::CompletePixelShaderWriteMotion() {
   }
   a_.OpEndIf();
   PopSystemTemp(2);
+}
+
+void DXBCShaderTranslator::CompletePixelShaderWriteReactive() {
+  u32 temp = PushSystemTemp();
+  a_.OpAnd(dxbc::Dest::R(temp, 0b0001), dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
+           dxbc::Src::LU(1));
+  a_.OpIf(true, dxbc::Src::R(temp, dxbc::Src::kXXXX));
+  {
+    // Visible colour: any of the components, as blending may weigh by alpha or add the colour.
+    const dxbc::Src color = dxbc::Src::R(system_temps_color_[0]);
+    a_.OpMax(dxbc::Dest::R(temp, 0b0010), color.SelectFromSwizzled(0),
+             color.SelectFromSwizzled(1));
+    a_.OpMax(dxbc::Dest::R(temp, 0b0010), dxbc::Src::R(temp, dxbc::Src::kYYYY),
+             color.SelectFromSwizzled(2));
+    a_.OpMax(dxbc::Dest::R(temp, 0b0010), dxbc::Src::R(temp, dxbc::Src::kYYYY),
+             color.SelectFromSwizzled(3));
+    a_.OpGE(dxbc::Dest::R(temp, 0b0010), dxbc::Src::R(temp, dxbc::Src::kYYYY),
+            dxbc::Src::LF(1.0f / 64.0f));
+    a_.OpIf(true, dxbc::Src::R(temp, dxbc::Src::kYYYY));
+    {
+      const u32 edram_size_32bpp_samples =
+          (xenos::kEDRAMTileHeightSamples * draw_resolution_scale_y_) *
+          (xenos::kEDRAMTileWidthSamples * draw_resolution_scale_x_) * xenos::kEDRAMTileCount;
+      a_.OpIAdd(dxbc::Dest::R(temp, 0b0100),
+                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
+                dxbc::Src::LU(edram_size_32bpp_samples));
+      if (uav_index_edram_ == kBindingIndexUnallocated) {
+        uav_index_edram_ = uav_count_++;
+      }
+      a_.OpLdUAVTyped(
+          dxbc::Dest::R(temp, 0b1000), dxbc::Src::R(temp, dxbc::Src::kZZZZ), 1,
+          dxbc::Src::U(uav_index_edram_, std::to_underlying(UAVRegister::kEDRAM), dxbc::Src::kXXXX));
+      a_.OpOr(dxbc::Dest::R(temp, 0b1000), dxbc::Src::R(temp, dxbc::Src::kWWWW),
+              dxbc::Src::LU(1));
+      a_.OpStoreUAVTyped(dxbc::Dest::U(uav_index_edram_, std::to_underlying(UAVRegister::kEDRAM)),
+                         dxbc::Src::R(temp, dxbc::Src::kZZZZ), 1,
+                         dxbc::Src::R(temp, dxbc::Src::kWWWW));
+    }
+    a_.OpEndIf();
+  }
+  a_.OpEndIf();
+  PopSystemTemp();
 }
 
 void DXBCShaderTranslator::CompletePixelShader() {

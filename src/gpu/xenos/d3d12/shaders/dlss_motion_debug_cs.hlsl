@@ -20,10 +20,11 @@ cbuffer constants : register(b0) {
 
 Texture2D<float> xe_depth : register(t0);
 Texture2D<float2> xe_object_motion : register(t1);
+Texture2D<float> xe_reactive : register(t2);
 RWTexture2D<float4> xe_dest : register(u0);
 // Object pixels, object motion and camera motion summed there (in quarter pixels, each capped at
 // 64 pixels), other pixels, camera motion summed there, and the difference between the object and
-// the camera motion summed over the object pixels.
+// the camera motion summed over the object pixels, and the reactive pixels.
 RWByteAddressBuffer xe_stats : register(u1);
 
 [numthreads(8, 8, 1)]
@@ -50,6 +51,9 @@ void main(uint3 id : SV_DispatchThreadID) {
       motion = object_motion;
       is_object = true;
     }
+  }
+  if (xe_reactive.Load(int3(xe_depth_origin + id.xy, 0)) > 0.5) {
+    xe_stats.InterlockedAdd(24, 1u);
   }
   uint camera_length = uint(min(length(camera_motion), 64.0) * 4.0);
   if (is_object) {

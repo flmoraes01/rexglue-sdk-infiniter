@@ -2,8 +2,9 @@
 // (one dword per depth sample, at the sample's depth address) into the scene motion texture, for
 // the part of the scene a depth resolve copies, and clears that region for the next tile.
 //
-// A dword is the inverted pair of halves (previous minus current NDC); zero means no motion was
-// written there, which becomes NaN in the texture (the camera motion is used instead).
+// A dword is the inverted pair of halves (previous minus current NDC) with bit 0 cleared; zero
+// means no motion was written there, which becomes NaN in the texture (the camera motion is used
+// instead). Bit 0 set means a blended draw added colour there afterwards: the reactive mask.
 //
 // Build: fxc /nologo /T cs_5_1 /E main /O3 /Vn kDlssMotionCopyCS
 //            /Fh bytecode/d3d12_5_1/dlss_motion_copy_cs.h dlss_motion_copy_cs.hlsl
@@ -22,6 +23,7 @@ cbuffer constants : register(b0) {
 
 RWBuffer<uint> xe_edram : register(u0);
 RWTexture2D<float2> xe_motion : register(u1);
+RWTexture2D<unorm float> xe_reactive : register(u2);
 
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -42,6 +44,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 
   uint packed = xe_edram[address];
   xe_edram[address] = 0u;
+  xe_reactive[xe_dest_origin + id.xy] = (packed & 1u) ? 1.0 : 0.0;
+  packed &= ~1u;
   float2 motion = asfloat(0x7FC00000u).xx;
   if (packed != 0u) {
     packed = ~packed;

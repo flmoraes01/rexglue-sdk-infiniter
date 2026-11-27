@@ -45,6 +45,8 @@ class DlssPass {
     // CopySceneMotion wrote this frame's object motion (texture mode): it replaces the camera
     // motion where the scene draws wrote theirs.
     bool object_motion = false;
+    // With object_motion: give DLSS the reactive mask (blended draws) as its bias mask.
+    bool reactive_mask = false;
     // Shows the motion vectors instead of the scene (see dlss_motion_debug_cs).
     bool debug_motion = false;
     ID3D12Resource* depth = nullptr;  // scene depth render target
@@ -166,7 +168,7 @@ class DlssPass {
   bool EnsureDlssFeature(ID3D12GraphicsCommandList* command_list, const Inputs& inputs);
   bool EnsureFsrContext(const Inputs& inputs);
   bool DispatchFsr(ID3D12GraphicsCommandList* command_list, const Inputs& inputs,
-                   ID3D12Resource* color);
+                   ID3D12Resource* color, ID3D12Resource* reactive);
   bool EnsureNrFeature(ID3D12GraphicsCommandList* command_list, const Inputs& inputs, u32 width,
                        u32 height);
   bool EvaluateNr(ID3D12GraphicsCommandList* command_list, const Inputs& inputs,
@@ -184,8 +186,9 @@ class DlssPass {
 
   // Descriptor slots of heap_.
   enum : u32 {
-    kSlotDepthSRV,     // inputs: the depth render target (t0, t1 contiguous)
+    kSlotDepthSRV,     // inputs: the depth render target (t0, t1, t2 contiguous)
     kSlotObjectMotionSRV,  // inputs: the scene motion texture
+    kSlotReactiveSRV,      // motion debug: the reactive mask
     kSlotDepthOutUAV,  // inputs: u0, u1 (contiguous)
     kSlotMotionOutUAV,
     kSlotSceneSRV,     // compose: the scene render target as the frame the model was given
@@ -215,9 +218,11 @@ class DlssPass {
     kSlotScaleSourceSRV,   // colour scale back: the chain's result
     kSlotMotionCopyEdramUAV,  // motion copy: u0, u1 (contiguous)
     kSlotMotionCopyOutUAV,
+    kSlotMotionCopyReactiveUAV,
     kSlotDebugOutUAV,  // motion debug: u0, u1 (contiguous)
     kSlotDebugStatsUAV,
-    kSlotSpareSRV,  // so a two-descriptor table may start at the last slot
+    kSlotSpareSRV,  // so a three-descriptor table may start at the last slots
+    kSlotSpareSRV2,
     kSlotCount,
   };
 
@@ -253,6 +258,8 @@ class DlssPass {
   Microsoft::WRL::ComPtr<ID3D12Resource> scene_motion_;
   u32 scene_motion_width_ = 0;
   u32 scene_motion_height_ = 0;
+  // Where blended scene draws added colour (R8, 1 there), filled with the object motion.
+  Microsoft::WRL::ComPtr<ID3D12Resource> scene_reactive_;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> gi_root_signature_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> gi_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12Resource> gi_out_;

@@ -3530,9 +3530,16 @@ void D3D12CommandProcessor::NoteDlssMotionDraw(
   const bool opaque = blend.color_srcblend == xenos::BlendFactor::kOne &&
                       blend.color_destblend == xenos::BlendFactor::kZero &&
                       blend.color_comb_fcn == xenos::BlendOp::kAdd;
-  if (!dlss_jitter_draw_ || !pixel_shader || memexport_used ||
-      !GetD3D12Settings().dlss_object_motion.Get() ||
-      render_target_cache_->GetPath() != RenderTargetCache::Path::kPixelShaderInterlock ||
+  const bool object_motion =
+      GetD3D12Settings().dlss_object_motion.Get() &&
+      render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+  // Blended scene draws (particles, effects) mark the reactive mask instead: their colour has no
+  // motion of its own and no history worth keeping.
+  if (dlss_scene_draw_ && !opaque && pixel_shader && !memexport_used && object_motion &&
+      GetD3D12Settings().dlss_reactive_mask.Get()) {
+    pixel_shader_modification.pixel.reactive_mask = 1;
+  }
+  if (!dlss_jitter_draw_ || !pixel_shader || memexport_used || !object_motion ||
       primitive_processing_result.host_vertex_shader_type != Shader::HostVertexShaderType::kVertex ||
       (primitive_type != xenos::PrimitiveType::kTriangleList &&
        primitive_type != xenos::PrimitiveType::kTriangleStrip) ||
@@ -3582,6 +3589,7 @@ void D3D12CommandProcessor::NoteDlssMotionDraw(
 
 void D3D12CommandProcessor::NoteDlssDraw(const Shader& vertex_shader) {
   dlss_jitter_draw_ = false;
+  dlss_scene_draw_ = false;
   dlss_shrink_draw_ = false;
   if (dlss_scene_done_ || !dlss_backbuffer_size_[0] || !IsDlssActive()) {
     return;
@@ -3629,6 +3637,7 @@ void D3D12CommandProcessor::NoteDlssDraw(const Shader& vertex_shader) {
     // stays put: jittered, it leaves columns of stale data where its pieces meet.
     const bool projected = regs.Get<xenos::reg::PA_CL_VTE_CNTL>().vport_x_scale_ena;
     if (scene_draw && depth_tested) {
+      dlss_scene_draw_ = true;
       dlss_jitter_draw_ = projected && GetD3D12Settings().dlss_jitter.Get() &&
                           GetDlssMode().dlss && IsUpscalerSupported() && dlss_ran_last_frame_;
       dlss_texture_jittered_draws_ += dlss_jitter_draw_ ? 1 : 0;
@@ -3731,6 +3740,7 @@ void D3D12CommandProcessor::RunDlssOnSceneTexture(ID3D12Resource* color,
   inputs.height = height;
   inputs.color_scale = dlss_scene_color_scale_;
   inputs.object_motion = dlss_motion_copies_ != 0;
+  inputs.reactive_mask = GetD3D12Settings().dlss_reactive_mask.Get();
   inputs.debug_motion = GetD3D12Settings().dlss_debug_view.Get() == "motion";
   RecordDlssCall(std::move(call));
 }

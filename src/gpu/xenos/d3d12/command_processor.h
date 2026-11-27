@@ -588,6 +588,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Object motion vectors (texture mode, ROV): the draw uses the motion vector shader variants,
   // with the vertex float constants it had in the previous frame after the current ones.
   bool dlss_motion_draw_ = false;
+  // Texture mode: the draw goes to the scene with a depth test (projected or not).
+  bool dlss_scene_draw_ = false;
   // Its previous constants were found (same shader, vertex buffer and order among such draws).
   bool dlss_motion_valid_ = false;
   std::vector<u32> dlss_motion_current_constants_;

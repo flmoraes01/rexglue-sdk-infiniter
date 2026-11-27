@@ -135,6 +135,9 @@ class D3D12Settings : public SettingOwner {
   REX_SETTING(bool, dlss_object_motion, true,
               "Texture mode with ROV: motion vectors of moving objects from each scene draw's "
               "previous vertex constants (off: camera motion only)");
+  REX_SETTING(bool, dlss_reactive_mask, true,
+              "With dlss_object_motion: blended scene draws (particles, effects) mark where DLSS "
+              "should favour the current frame (its bias mask)");
   REX_SETTING(bool, dlss_jitter, true,
               "Shift the scene by a sub-pixel amount each frame for DLSS (off only to debug)");
   REX_SETTING(bool, dlss_jitter_invert, false,

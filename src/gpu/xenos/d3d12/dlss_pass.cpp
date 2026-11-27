@@ -124,9 +124,9 @@ bool DlssPass::Initialize(ID3D12Device* device) {
   device_ = device;
   D3D12_DESCRIPTOR_RANGE ranges[2] = {};
   ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  ranges[0].NumDescriptors = 2;
+  ranges[0].NumDescriptors = 3;
   ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-  ranges[1].NumDescriptors = 2;
+  ranges[1].NumDescriptors = 3;
   D3D12_ROOT_PARAMETER parameters[3] = {};
   parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   parameters[0].Constants.Num32BitValues = sizeof(InputsConstants) / sizeof(u32);
@@ -381,6 +381,7 @@ void DlssPass::Shutdown() {
   motion_stats_zero_.Reset();
   motion_stats_readback_.Reset();
   scene_motion_.Reset();
+  scene_reactive_.Reset();
   scene_motion_width_ = scene_motion_height_ = 0;
   gi_pipeline_.Reset();
   gi_root_signature_.Reset();
@@ -629,8 +630,9 @@ void DlssPass::CopySceneMotion(ID3D12GraphicsCommandList* command_list, ID3D12Re
   }
   if (!scene_motion_ || scene_motion_width_ != scene_width ||
       scene_motion_height_ != scene_height) {
-    // A resolution change means a restart, so nothing in flight uses the old texture.
+    // A resolution change means a restart, so nothing in flight uses the old textures.
     scene_motion_.Reset();
+    scene_reactive_.Reset();
     scene_motion_width_ = scene_motion_height_ = 0;
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -641,10 +643,18 @@ void DlssPass::CopySceneMotion(ID3D12GraphicsCommandList* command_list, ID3D12Re
     desc.Format = DXGI_FORMAT_R16G16_FLOAT;
     desc.SampleDesc.Count = 1;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_RESOURCE_DESC reactive_desc = desc;
+    reactive_desc.Format = DXGI_FORMAT_R8_UNORM;
     if (FAILED(device_->CreateCommittedResource(
             &objects::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&scene_motion_)))) {
-      REXGPU_WARN("DLSS: cannot create the {}x{} scene motion texture", scene_width, scene_height);
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&scene_motion_))) ||
+        FAILED(device_->CreateCommittedResource(
+            &objects::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &reactive_desc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&scene_reactive_)))) {
+      REXGPU_WARN("DLSS: cannot create the {}x{} scene motion textures", scene_width,
+                  scene_height);
+      scene_motion_.Reset();
+      scene_reactive_.Reset();
       return;
     }
     scene_motion_width_ = scene_width;
@@ -662,6 +672,8 @@ void DlssPass::CopySceneMotion(ID3D12GraphicsCommandList* command_list, ID3D12Re
                                      CpuDescriptor(kSlotMotionCopyEdramUAV));
   device_->CreateUnorderedAccessView(scene_motion_.Get(), nullptr, nullptr,
                                      CpuDescriptor(kSlotMotionCopyOutUAV));
+  device_->CreateUnorderedAccessView(scene_reactive_.Get(), nullptr, nullptr,
+                                     CpuDescriptor(kSlotMotionCopyReactiveUAV));
   ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
   command_list->SetDescriptorHeaps(1, heaps);
   command_list->SetComputeRootSignature(root_signature_.Get());
@@ -670,12 +682,13 @@ void DlssPass::CopySceneMotion(ID3D12GraphicsCommandList* command_list, ID3D12Re
   command_list->SetComputeRootDescriptorTable(1, GpuDescriptor(kSlotDepthSRV));
   command_list->SetComputeRootDescriptorTable(2, GpuDescriptor(kSlotMotionCopyEdramUAV));
   command_list->Dispatch((copy.size[0] + 7) / 8, (copy.size[1] + 7) / 8, 1);
-  D3D12_RESOURCE_BARRIER uav[2] = {};
-  uav[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-  uav[0].UAV.pResource = edram;
-  uav[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-  uav[1].UAV.pResource = scene_motion_.Get();
-  command_list->ResourceBarrier(2, uav);
+  D3D12_RESOURCE_BARRIER uav[3] = {};
+  ID3D12Resource* written[3] = {edram, scene_motion_.Get(), scene_reactive_.Get()};
+  for (u32 i = 0; i < 3; ++i) {
+    uav[i].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav[i].UAV.pResource = written[i];
+  }
+  command_list->ResourceBarrier(3, uav);
 }
 
 void DlssPass::ScaleColor(ID3D12GraphicsCommandList* command_list, u32 source_slot, u32 x, u32 y,
@@ -812,9 +825,9 @@ void DlssPass::RecordMotionStats(ID3D12GraphicsCommandList* command_list) {
       auto mean = [](u32 sum, u32 count) { return count ? sum / (4.0 * count) : 0.0; };
       REXGPU_INFO("DLSS motion: {} pixels with object motion, mean {:.2f} px (camera motion "
                   "there {:.2f} px, difference {:.2f} px); {} pixels with camera motion, mean "
-                  "{:.2f} px",
+                  "{:.2f} px; {} reactive pixels",
                   v[0], mean(v[1], v[0]), mean(v[2], v[0]), mean(v[5], v[0]), v[3],
-                  mean(v[4], v[3]));
+                  mean(v[4], v[3]), v[6]);
       const D3D12_RANGE none = {0, 0};
       motion_stats_readback_->Unmap(0, &none);
     }
@@ -1174,7 +1187,7 @@ bool DlssPass::EnsureFsrContext(const Inputs& inputs) {
 }
 
 bool DlssPass::DispatchFsr(ID3D12GraphicsCommandList* command_list, const Inputs& inputs,
-                           ID3D12Resource* color) {
+                           ID3D12Resource* color, ID3D12Resource* reactive) {
 #if REX_FFX
   ffxDispatchDescUpscale dispatch = {};
   dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
@@ -1184,6 +1197,10 @@ bool DlssPass::DispatchFsr(ID3D12GraphicsCommandList* command_list, const Inputs
   dispatch.motionVectors =
       ffxApiGetResourceDX12(motion_out_.Get(), FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
   dispatch.output = ffxApiGetResourceDX12(color_out_.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+  if (reactive) {
+    // Blended scene draws (see the reactive mask), read from the origin like the colour.
+    dispatch.reactive = ffxApiGetResourceDX12(reactive, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+  }
   dispatch.jitterOffset = {inputs.jitter_x, inputs.jitter_y};
   dispatch.motionVectorScale = {1.0f, 1.0f};  // already in rendered pixels
   dispatch.renderSize = {inputs.render_width, inputs.render_height};
@@ -1341,8 +1358,13 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
 
   Barriers barriers;
   barriers.Add(inputs.depth, inputs.depth_state, kShaderRead);
+  // The reactive mask goes to DLSS as its bias mask.
+  const bool reactive_mask = object_motion && inputs.reactive_mask && scene_reactive_;
   if (object_motion) {
     barriers.Add(scene_motion_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kShaderRead);
+  }
+  if (reactive_mask) {
+    barriers.Add(scene_reactive_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kShaderRead);
   }
   barriers.Add(inputs.color, inputs.color_state, kShaderRead);
   barriers.Submit(command_list);
@@ -1510,7 +1532,10 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
   }
   if (fsr) {
     // FSR reads its colour from the origin of the resource.
-    if (current_x || current_y || !DispatchFsr(command_list, inputs, current)) {
+    if (current_x || current_y ||
+        !DispatchFsr(command_list, inputs, current,
+                     reactive_mask && !inputs.depth_x && !inputs.depth_y ? scene_reactive_.Get()
+                                                                         : nullptr)) {
       failed_ = true;
     } else {
       barriers.Add(color_out_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kShaderRead);
@@ -1573,6 +1598,11 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
     eval.InMVScaleY = 1.0f;
     eval.InColorSubrectBase.X = current_x;
     eval.InColorSubrectBase.Y = current_y;
+    if (reactive_mask) {
+      eval.pInBiasCurrentColorMask = scene_reactive_.Get();
+      eval.InBiasCurrentColorSubrectBase.X = inputs.depth_x;
+      eval.InBiasCurrentColorSubrectBase.Y = inputs.depth_y;
+    }
     NVSDK_NGX_Result result =
         NGX_D3D12_EVALUATE_DLSS_EXT(command_list, feature_, parameters_, &eval);
     if (NVSDK_NGX_FAILED(result)) {
@@ -1592,6 +1622,10 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
     // motion still bound for the inputs.
     device_->CreateUnorderedAccessView(color_out_.Get(), nullptr, nullptr,
                                        CpuDescriptor(kSlotDebugOutUAV));
+    D3D12_SHADER_RESOURCE_VIEW_DESC reactive_srv = motion_srv;
+    reactive_srv.Format = DXGI_FORMAT_R8_UNORM;
+    device_->CreateShaderResourceView(reactive_mask ? scene_reactive_.Get() : nullptr,
+                                      &reactive_srv, CpuDescriptor(kSlotReactiveSRV));
     D3D12_UNORDERED_ACCESS_VIEW_DESC stats_uav = {};
     stats_uav.Format = DXGI_FORMAT_R32_TYPELESS;
     stats_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -1701,6 +1735,9 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
   barriers.Add(inputs.depth, kShaderRead, inputs.depth_state);
   if (object_motion) {
     barriers.Add(scene_motion_.Get(), kShaderRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
+  if (reactive_mask) {
+    barriers.Add(scene_reactive_.Get(), kShaderRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   }
   barriers.Submit(command_list);
 #else

@@ -69,7 +69,7 @@ class DXBCShaderTranslator : public ShaderTranslator {
      * Layout version in 0xYYYYMMDD form, increased on incompatible changes to invalidate pipeline
      * storage.
      */
-    static constexpr u32 kVersion = 0x2026112F;
+    static constexpr u32 kVersion = 0x20261130;
 
     // NOLINTNEXTLINE(performance-enum-size): packed key bit field, MSVC packs per type
     enum class DepthStencilMode : u32 {
@@ -136,8 +136,15 @@ class DXBCShaderTranslator : public ShaderTranslator {
        * ROV only: writes the motion from the vertex shader's motion outputs (see the vertex
        * modification) for the first sample, as the previous minus the current NDC position in two
        * halves, to the motion region after EDRAM. All ones when kSysFlagMotionValid is clear.
+       * Stored inverted with bit 0 clear (zero means no motion).
        */
       u32 motion_vectors : 1;
+      /**
+       * ROV only, for blended scene draws (particles, effects): sets bit 0 of the first sample's
+       * motion region dword where the shader adds visible colour, the reactive mask for temporal
+       * upscalers (the colour there has no history worth keeping).
+       */
+      u32 reactive_mask : 1;
     } pixel;
 
     explicit Modification(u64 modification_value = 0) : value(modification_value) {
@@ -834,6 +841,8 @@ class DXBCShaderTranslator : public ShaderTranslator {
   void CompleteVertexOrDomainShader();
   // Motion vector pixel shaders on ROV: the motion of the first sample, if it passed.
   void CompletePixelShaderWriteMotion();
+  // Reactive mask pixel shaders on ROV: marks the first sample, if it passed and adds colour.
+  void CompletePixelShaderWriteReactive();
   /**
    * Tests a sample against alpha to mask.
    *
