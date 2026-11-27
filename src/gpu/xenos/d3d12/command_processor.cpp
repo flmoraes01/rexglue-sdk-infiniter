@@ -15,6 +15,9 @@
 #include <format>
 #include <cstdio>
 #include <cmath>
+#include <cstdio>
+
+#include <rex/gpu/scene_camera.h>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -3459,8 +3462,9 @@ bool D3D12CommandProcessor::IsDlssActive() {
   if ((!active_mode.dlss && !active_mode.smaa && !settings.dlss_nr.Get() &&
        settings.sharpening.Get() <= 0.0 && settings.frame_generation.Get() == "off" &&
        !settings.ssgi.Get()) ||
-      settings.dlss_scene_address.Get().empty() ||
-      render_target_cache_->GetPath() != RenderTargetCache::Path::kHostRenderTargets) {
+      (settings.dlss_scene_address.Get().empty() && settings.dlss_scene_texture.Get().empty()) ||
+      (settings.dlss_scene_texture.Get().empty() &&
+       render_target_cache_->GetPath() != RenderTargetCache::Path::kHostRenderTargets)) {
     return false;
   }
   if (!dlss_initialize_attempted_) {
@@ -3507,6 +3511,30 @@ void D3D12CommandProcessor::NoteDlssDraw(const Shader& vertex_shader) {
     return;
   }
   const xenos::RegisterFile& regs = *register_file_;
+  if (const std::string& target = GetD3D12Settings().dlss_scene_texture.Get(); !target.empty()) {
+    // Texture mode: the scene draws are the ones into the scene render target (by its format and
+    // MSAA, as tiles of the frame are not full-frame draws).
+    const std::string& scene_target = GetD3D12Settings().dlss_scene_target.Get();
+    if (scene_target != dlss_scene_target_text_) {
+      dlss_scene_target_text_ = scene_target;
+      dlss_scene_target_format_ = dlss_scene_target_msaa_ = UINT32_MAX;
+      if (const size_t colon = scene_target.find(':'); colon != std::string::npos) {
+        dlss_scene_target_format_ = static_cast<u32>(std::strtoul(scene_target.c_str(), nullptr, 10));
+        dlss_scene_target_msaa_ =
+            static_cast<u32>(std::strtoul(scene_target.c_str() + colon + 1, nullptr, 10));
+      }
+    }
+    const auto color_info =
+        regs.Get<xenos::reg::RB_COLOR_INFO>(xenos::reg::RB_COLOR_INFO::kRTRegisterIndices[0]);
+    const auto surface_info = regs.Get<xenos::reg::RB_SURFACE_INFO>();
+    // Depth-only passes into the same target (a depth prepass) need the same jitter.
+    if (static_cast<u32>(color_info.color_format) == dlss_scene_target_format_ &&
+        static_cast<u32>(surface_info.msaa_samples) == dlss_scene_target_msaa_) {
+      dlss_jitter_draw_ = GetD3D12Settings().dlss_jitter.Get() && GetDlssMode().dlss &&
+                          IsUpscalerSupported() && dlss_ran_last_frame_;
+    }
+    return;
+  }
   // Scene draws cover the whole frame; shadow maps and half-resolution passes do not.
   const auto vte = regs.Get<xenos::reg::PA_CL_VTE_CNTL>();
   const f32 width =
@@ -3543,6 +3571,48 @@ void D3D12CommandProcessor::NoteDlssDraw(const Shader& vertex_shader) {
   }
 }
 
+const D3D12CommandProcessor::DlssSceneTextureSpec&
+D3D12CommandProcessor::GetDlssSceneTextureSpec() {
+  const std::string& text = GetD3D12Settings().dlss_scene_texture.Get();
+  if (text != dlss_scene_texture_text_) {
+    dlss_scene_texture_text_ = text;
+    DlssSceneTextureSpec spec;
+    unsigned width = 0, height = 0, color = 0, depth = 0;
+    if (sscanf_s(text.c_str(), "%ux%u:%u:%u", &width, &height, &color, &depth) == 4) {
+      spec = {width, height, color, depth, true};
+    }
+    dlss_scene_texture_spec_ = spec;
+  }
+  return dlss_scene_texture_spec_;
+}
+
+void D3D12CommandProcessor::RunDlssOnSceneTexture(ID3D12Resource* color,
+                                                  D3D12_RESOURCE_STATES color_state,
+                                                  ID3D12Resource* depth,
+                                                  D3D12_RESOURCE_STATES depth_state, u32 width,
+                                                  u32 height) {
+  if (dlss_scene_done_ || !IsDlssActive()) {
+    return;
+  }
+  dlss_scene_done_ = true;
+  // The title's camera for the frame being processed (the swaps it presented before it).
+  std::array<f32, 16> view_projection;
+  dlss_view_projection_valid_ = rex::gpu::GetSceneCamera(dlss_swaps_processed_, view_projection);
+  if (dlss_view_projection_valid_) {
+    dlss_view_projection_ = view_projection;
+  }
+  auto call = std::make_unique<DlssCall>();
+  call->processor = this;
+  DlssPass::Inputs& inputs = call->inputs;
+  inputs.color = color;
+  inputs.color_state = color_state;
+  inputs.depth = depth;
+  inputs.depth_state = depth_state;
+  inputs.width = width;
+  inputs.height = height;
+  RecordDlssCall(std::move(call));
+}
+
 void D3D12CommandProcessor::RunDlssBeforeResolve(const draw_state::ResolveRequest& resolve_info) {
   if (dlss_scene_done_ || resolve_info.IsCopyingDepth() || !IsDlssActive()) {
     return;
@@ -3571,6 +3641,12 @@ void D3D12CommandProcessor::RunDlssBeforeResolve(const draw_state::ResolveReques
                               dlss_backbuffer_size_[1]));
     return;
   }
+  RecordDlssCall(std::move(call));
+}
+
+void D3D12CommandProcessor::RecordDlssCall(std::unique_ptr<DlssCall> call) {
+  DlssPass::Inputs& inputs = call->inputs;
+  const D3D12Settings& settings = GetD3D12Settings();
   NoteDlssState("");
   dlss_ran_this_frame_ = true;
   const DlssMode mode = GetDlssMode();
@@ -3588,6 +3664,9 @@ void D3D12CommandProcessor::RunDlssBeforeResolve(const draw_state::ResolveReques
   inputs.gi_ao_strength = static_cast<f32>(settings.ssgi_ao_strength.Get());
   inputs.gi_radius = static_cast<f32>(settings.ssgi_radius.Get());
   inputs.quality = mode.quality;
+  if (!settings.dlss_scene_texture.Get().empty()) {
+    inputs.quality = 5;  // NVSDK_NGX_PerfQuality_Value_DLAA
+  }
   if (dlss_render_ratio_ < 1.0f) {
     if (!dlss_ran_last_frame_) {
       // This frame was drawn at full size; Super Resolution starts with the next one.
@@ -3782,11 +3861,15 @@ void D3D12CommandProcessor::EndDlssFrame(u32 frontbuffer_width, u32 frontbuffer_
     LogDlssState();
   }
   if (!dlss_scene_done_ && dlss_initialize_attempted_ && IsDlssActive()) {
-    NoteDlssState(std::format("no colour resolve to the scene address this frame ({}x{} swap)",
-                              frontbuffer_width, frontbuffer_height));
+    NoteDlssState(GetD3D12Settings().dlss_scene_texture.Get().empty()
+                      ? std::format("no colour resolve to the scene address this frame ({}x{} swap)",
+                                    frontbuffer_width, frontbuffer_height)
+                      : std::format("no load of the scene texture this frame ({}x{} swap)",
+                                    frontbuffer_width, frontbuffer_height));
   }
   dlss_backbuffer_size_[0] = frontbuffer_width;
   dlss_backbuffer_size_[1] = frontbuffer_height;
+  ++dlss_swaps_processed_;
   if (dlss_scene_done_) {
     dlss_previous_view_projection_ = dlss_view_projection_;
     dlss_previous_view_projection_valid_ = dlss_view_projection_valid_;
@@ -3804,7 +3887,9 @@ void D3D12CommandProcessor::EndDlssFrame(u32 frontbuffer_width, u32 frontbuffer_
   }
   // The next frame's mode. A mode change restarts DLSS from a full-size frame.
   // Without the chosen upscaler there is nothing to upscale with: the scene stays full size.
-  const f32 ratio = IsUpscalerSupported() ? GetDlssMode().ratio : 1.0f;
+  const f32 ratio = IsUpscalerSupported() && GetD3D12Settings().dlss_scene_texture.Get().empty()
+                        ? GetDlssMode().ratio
+                        : 1.0f;
   const auto now = std::chrono::steady_clock::now();
   if (dlss_last_frame_time_.time_since_epoch().count()) {
     dlss_frame_time_ms_ = std::clamp(

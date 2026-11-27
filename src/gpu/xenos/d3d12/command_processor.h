@@ -104,6 +104,16 @@ class D3D12CommandProcessor : public CommandProcessor {
   /** Runs DLSS on the scene render target when this resolve ends the title's 3D scene. */
   void RunDlssBeforeResolve(const draw_state::ResolveRequest& resolve_info);
 
+  /** Texture mode (gpu.d3d12.dlss_scene_texture): the scene colour and depth as loaded. */
+  struct DlssSceneTextureSpec {
+    u32 width = 0, height = 0, color_format = 0, depth_format = 0;
+    bool valid = false;
+  };
+  const DlssSceneTextureSpec& GetDlssSceneTextureSpec();
+  void RunDlssOnSceneTexture(ID3D12Resource* color, D3D12_RESOURCE_STATES color_state,
+                             ID3D12Resource* depth, D3D12_RESOURCE_STATES depth_state, u32 width,
+                             u32 height);
+
   /**
    * Finds or creates the root signature for a pipeline.
    *
@@ -515,6 +525,7 @@ class D3D12CommandProcessor : public CommandProcessor {
     D3D12CommandProcessor* processor;
     DlssPass::Inputs inputs;
   };
+  void RecordDlssCall(std::unique_ptr<DlssCall> call);
   static void DlssHostCall(void* user, ID3D12GraphicsCommandList* command_list);
   struct DlssMode {
     bool dlss = false;  // DLAA or Super Resolution
@@ -543,6 +554,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool dlss_view_projection_valid_ = false;
   bool dlss_previous_view_projection_valid_ = false;
   bool dlss_scene_done_ = false;
+  // Texture mode.
+  u64 dlss_swaps_processed_ = 0;
+  std::string dlss_scene_texture_text_;
+  DlssSceneTextureSpec dlss_scene_texture_spec_;
+  std::string dlss_scene_target_text_;
+  u32 dlss_scene_target_format_ = UINT32_MAX;
+  u32 dlss_scene_target_msaa_ = UINT32_MAX;
   // Why DLSS did not run on the last frame ("" while it runs), logged when it changes.
   std::string dlss_state_;
   // Diagnostics: the largest viewport of a draw with a colour target this frame, and how many

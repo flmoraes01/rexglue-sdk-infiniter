@@ -295,6 +295,7 @@ class D3D12TextureCache final : public TextureCache {
 
     ID3D12Resource* GetResource() const { return resource_.Get(); }
 
+    D3D12_RESOURCE_STATES GetResourceState() const { return resource_state_; }
     D3D12_RESOURCE_STATES SetResourceState(D3D12_RESOURCE_STATES new_state) {
       D3D12_RESOURCE_STATES old_state = resource_state_;
       resource_state_ = new_state;
@@ -559,6 +560,10 @@ class D3D12TextureCache final : public TextureCache {
                                             30];
   u64 scaled_resolve_current_range_start_scaled_;
   u64 scaled_resolve_current_range_length_scaled_;
+
+  // DLSS texture mode: the key of the scene depth texture, seen on an earlier load.
+  TextureKey dlss_scene_depth_key_;
+  bool dlss_scene_depth_key_valid_ = false;
 };
 
 }  // namespace rex::gpu::d3d12

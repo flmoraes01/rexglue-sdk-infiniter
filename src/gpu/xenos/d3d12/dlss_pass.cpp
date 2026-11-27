@@ -1045,6 +1045,12 @@ bool DlssPass::EnsureDlssFeature(ID3D12GraphicsCommandList* command_list, const 
       static_cast<NVSDK_NGX_PerfQuality_Value>(inputs.quality);
   create_params.InFeatureCreateFlags =
       NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+  // A float scene is linear HDR (values above 1); DLSS treats colour as [0, 1] otherwise.
+  const DXGI_FORMAT color_format = TypedColorFormat(inputs.color->GetDesc().Format);
+  if (color_format == DXGI_FORMAT_R16G16B16A16_FLOAT || color_format == DXGI_FORMAT_R11G11B10_FLOAT ||
+      color_format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+    create_params.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+  }
   NVSDK_NGX_Result result =
       NGX_D3D12_CREATE_DLSS_EXT(command_list, 1, 1, &feature_, parameters_, &create_params);
   if (NVSDK_NGX_FAILED(result) || !feature_) {

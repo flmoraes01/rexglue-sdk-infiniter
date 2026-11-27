@@ -142,6 +142,14 @@ class D3D12Settings : public SettingOwner {
   REX_SETTING(i32, dlss_camera_register, 0,
               "Title: first float constant of the view-projection matrix (4 rows, row vector)",
               Range{0, 252});
+  REX_SETTING(std::string, dlss_scene_texture, "",
+              "Texture mode for titles that draw the scene in tiles: WIDTHxHEIGHT:COLOR:DEPTH, the "
+              "guest texture formats of the scene colour and depth the title loads before its "
+              "post-processing. DLAA runs on the loaded colour texture; the camera comes from "
+              "rex::gpu::SubmitSceneCamera");
+  REX_SETTING(std::string, dlss_scene_target, "",
+              "Texture mode: COLOR_FORMAT:MSAA of the render target the scene is drawn to, whose "
+              "draws get the DLSS jitter");
 };
 
 }  // namespace rex::gpu::d3d12

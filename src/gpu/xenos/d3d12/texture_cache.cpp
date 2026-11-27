@@ -1845,6 +1845,25 @@ bool D3D12TextureCache::LoadHostTextureDataFromResidentMemory(Texture& texture, 
 
   command_processor_.ReleaseScratchGPUBuffer(copy_buffer, copy_buffer_state);
 
+  // DLSS texture mode: the scene colour runs DLAA with the scene depth of this frame, loaded here
+  // even though the title binds it later (its resolve already happened).
+  if (const auto& spec = command_processor_.GetDlssSceneTextureSpec();
+      spec.valid && level_first == 0 && width == spec.width && height == spec.height) {
+    if (static_cast<u32>(guest_format) == spec.depth_format) {
+      dlss_scene_depth_key_ = texture_key;
+      dlss_scene_depth_key_valid_ = true;
+    } else if (static_cast<u32>(guest_format) == spec.color_format && dlss_scene_depth_key_valid_) {
+      if (Texture* scene_depth = FindOrCreateTexture(dlss_scene_depth_key_);
+          scene_depth != nullptr && LoadTextureData(*scene_depth)) {
+        auto& d3d12_depth = static_cast<D3D12Texture&>(*scene_depth);
+        command_processor_.SubmitBarriers();
+        command_processor_.RunDlssOnSceneTexture(
+            d3d12_texture.GetResource(), d3d12_texture.GetResourceState(),
+            d3d12_depth.GetResource(), d3d12_depth.GetResourceState(),
+            d3d12_texture.GetResource()->GetDesc().Width, d3d12_texture.GetResource()->GetDesc().Height);
+      }
+    }
+  }
   if (gpu::ITextureLoadHook* hook = gpu::GetTextureLoadHook();
       hook != nullptr && level_first == 0 &&
       hook->WantsTexture(width, height, static_cast<u32>(guest_format))) {
