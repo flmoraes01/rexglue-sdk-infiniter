@@ -12,6 +12,7 @@
 #include <bit>
 #include <algorithm>
 #include <chrono>
+#include <format>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -2772,6 +2773,7 @@ void D3D12CommandProcessor::PassTimingBoundary(const char* label) {
   deferred_command_list_.D3DEndQuery(pass_timing_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
                                      pass_timing_next_query_++);
   pass_timing_labels_.push_back(it->second);
+  pass_timing_frame_sequence_.push_back(it->second);
 }
 
 void D3D12CommandProcessor::PassTimingEndSubmission() {
@@ -2864,7 +2866,22 @@ bool D3D12CommandProcessor::IssueCopy() {
     return false;
   }
   if (pass_timing_enabled_) {
-    PassTimingBoundary("resolve");
+    const xenos::RegisterFile& regs = *register_file_;
+    const auto copy_control = regs.Get<xenos::reg::RB_COPY_CONTROL>();
+    const auto dest_info = regs.Get<xenos::reg::RB_COPY_DEST_INFO>();
+    const auto dest_pitch = regs.Get<xenos::reg::RB_COPY_DEST_PITCH>();
+    const u32 dest_base = regs[std::to_underlying(xenos::Register::RB_COPY_DEST_BASE)];
+    char label[160];
+    if (copy_control.copy_src_select >= 4) {
+      std::snprintf(label, sizeof(label), "resolve depth -> %08X %ux%u fmt %u", dest_base,
+                    dest_pitch.copy_dest_pitch, dest_pitch.copy_dest_height,
+                    static_cast<u32>(dest_info.copy_dest_format));
+    } else {
+      std::snprintf(label, sizeof(label), "resolve color%u -> %08X %ux%u fmt %u",
+                    copy_control.copy_src_select, dest_base, dest_pitch.copy_dest_pitch,
+                    dest_pitch.copy_dest_height, static_cast<u32>(dest_info.copy_dest_format));
+    }
+    PassTimingBoundary(label);
     pass_timing_key_ = UINT64_MAX;  // the next draw opens a new pass
   }
   ReadbackResolveMode readback_mode =
@@ -3427,6 +3444,29 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     frame_open_ = false;
     closed_frame_submissions_[(frame_current_++) % kQueueFrames] = submission_current_ - 1;
     ++pass_timing_frames_;
+    // Every 600 frames, the ordered passes of the frame that just closed.
+    if (pass_timing_enabled_ && frame_current_ % 600 == 0) {
+      REXGPU_INFO("pass_timing: sequence of frame {}", frame_current_ - 1);
+      u32 previous = UINT32_MAX;
+      u32 repeat = 0;
+      auto flush = [&]() {
+        if (previous != UINT32_MAX) {
+          REXGPU_INFO("pass_timing:   {}{}", pass_timing_label_names_[previous],
+                      repeat > 1 ? std::format(" (x{})", repeat) : std::string());
+        }
+      };
+      for (u32 label : pass_timing_frame_sequence_) {
+        if (label == previous) {
+          ++repeat;
+          continue;
+        }
+        flush();
+        previous = label;
+        repeat = 1;
+      }
+      flush();
+    }
+    pass_timing_frame_sequence_.clear();
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;

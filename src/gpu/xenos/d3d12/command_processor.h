@@ -461,6 +461,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   u32 pass_timing_submission_first_query_ = 0;
   u64 pass_timing_key_ = UINT64_MAX;
   std::vector<u32> pass_timing_labels_;  // label index of each segment of the open submission
+  std::vector<u32> pass_timing_frame_sequence_;  // labels of the open frame, in order
   struct PassTimingSubmission {
     u64 submission;
     u32 first_query;
