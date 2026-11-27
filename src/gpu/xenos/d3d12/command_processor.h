@@ -556,11 +556,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool dlss_scene_done_ = false;
   // Texture mode.
   u64 dlss_swaps_processed_ = 0;
+  u32 dlss_texture_scene_draws_ = 0;
+  u32 dlss_texture_jittered_draws_ = 0;
+  u32 dlss_texture_cameras_found_ = 0;
+  u32 dlss_texture_cameras_missing_ = 0;
   std::string dlss_scene_texture_text_;
   DlssSceneTextureSpec dlss_scene_texture_spec_;
   std::string dlss_scene_target_text_;
-  u32 dlss_scene_target_format_ = UINT32_MAX;
-  u32 dlss_scene_target_msaa_ = UINT32_MAX;
+  std::vector<std::pair<u32, u32>> dlss_scene_targets_;  // colour format, MSAA (UINT32_MAX any)
   // Why DLSS did not run on the last frame ("" while it runs), logged when it changes.
   std::string dlss_state_;
   // Diagnostics: the largest viewport of a draw with a colour target this frame, and how many

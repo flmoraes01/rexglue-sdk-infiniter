@@ -148,8 +148,8 @@ class D3D12Settings : public SettingOwner {
               "post-processing. DLAA runs on the loaded colour texture; the camera comes from "
               "rex::gpu::SubmitSceneCamera");
   REX_SETTING(std::string, dlss_scene_target, "",
-              "Texture mode: COLOR_FORMAT:MSAA of the render target the scene is drawn to, whose "
-              "draws get the DLSS jitter");
+              "Texture mode: comma-separated COLOR_FORMAT:MSAA (MSAA * for any) of the render "
+              "targets the scene is drawn to, whose draws get the DLSS jitter");
 };
 
 }  // namespace rex::gpu::d3d12

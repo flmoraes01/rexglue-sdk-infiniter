@@ -3516,22 +3516,41 @@ void D3D12CommandProcessor::NoteDlssDraw(const Shader& vertex_shader) {
     // MSAA, as tiles of the frame are not full-frame draws).
     const std::string& scene_target = GetD3D12Settings().dlss_scene_target.Get();
     if (scene_target != dlss_scene_target_text_) {
+      // Comma-separated FORMAT:MSAA entries; MSAA * matches any.
       dlss_scene_target_text_ = scene_target;
-      dlss_scene_target_format_ = dlss_scene_target_msaa_ = UINT32_MAX;
-      if (const size_t colon = scene_target.find(':'); colon != std::string::npos) {
-        dlss_scene_target_format_ = static_cast<u32>(std::strtoul(scene_target.c_str(), nullptr, 10));
-        dlss_scene_target_msaa_ =
-            static_cast<u32>(std::strtoul(scene_target.c_str() + colon + 1, nullptr, 10));
+      dlss_scene_targets_.clear();
+      size_t position = 0;
+      while (position < scene_target.size()) {
+        size_t comma = scene_target.find(',', position);
+        if (comma == std::string::npos) {
+          comma = scene_target.size();
+        }
+        const std::string item = scene_target.substr(position, comma - position);
+        if (const size_t colon = item.find(':'); colon != std::string::npos) {
+          const u32 format = static_cast<u32>(std::strtoul(item.c_str(), nullptr, 10));
+          const u32 msaa = item[colon + 1] == '*'
+                               ? UINT32_MAX
+                               : static_cast<u32>(std::strtoul(item.c_str() + colon + 1, nullptr, 10));
+          dlss_scene_targets_.push_back({format, msaa});
+        }
+        position = comma + 1;
       }
     }
     const auto color_info =
         regs.Get<xenos::reg::RB_COLOR_INFO>(xenos::reg::RB_COLOR_INFO::kRTRegisterIndices[0]);
     const auto surface_info = regs.Get<xenos::reg::RB_SURFACE_INFO>();
+    const u32 format = static_cast<u32>(color_info.color_format);
+    const u32 msaa = static_cast<u32>(surface_info.msaa_samples);
     // Depth-only passes into the same target (a depth prepass) need the same jitter.
-    if (static_cast<u32>(color_info.color_format) == dlss_scene_target_format_ &&
-        static_cast<u32>(surface_info.msaa_samples) == dlss_scene_target_msaa_) {
+    const bool scene_draw = std::any_of(
+        dlss_scene_targets_.begin(), dlss_scene_targets_.end(), [&](const std::pair<u32, u32>& t) {
+          return t.first == format && (t.second == UINT32_MAX || t.second == msaa);
+        });
+    if (scene_draw) {
       dlss_jitter_draw_ = GetD3D12Settings().dlss_jitter.Get() && GetDlssMode().dlss &&
                           IsUpscalerSupported() && dlss_ran_last_frame_;
+      dlss_texture_jittered_draws_ += dlss_jitter_draw_ ? 1 : 0;
+      ++dlss_texture_scene_draws_;
     }
     return;
   }
@@ -3595,11 +3614,17 @@ void D3D12CommandProcessor::RunDlssOnSceneTexture(ID3D12Resource* color,
     return;
   }
   dlss_scene_done_ = true;
+  if (dlss_texture_scene_draws_ == 0) {
+    NoteDlssState("texture mode: no draw this frame went to gpu.d3d12.dlss_scene_target");
+  }
   // The title's camera for the frame being processed (the swaps it presented before it).
   std::array<f32, 16> view_projection;
   dlss_view_projection_valid_ = rex::gpu::GetSceneCamera(dlss_swaps_processed_, view_projection);
   if (dlss_view_projection_valid_) {
     dlss_view_projection_ = view_projection;
+    ++dlss_texture_cameras_found_;
+  } else {
+    ++dlss_texture_cameras_missing_;
   }
   auto call = std::make_unique<DlssCall>();
   call->processor = this;
@@ -3680,7 +3705,10 @@ void D3D12CommandProcessor::RecordDlssCall(std::unique_ptr<DlssCall> call) {
   }
   // The jitter the scene was drawn with this frame (none on the first frame DLSS runs).
   const f32 jitter_sign = settings.dlss_jitter_invert.Get() ? -1.0f : 1.0f;
-  const bool jittered = settings.dlss_jitter.Get() && inputs.dlss && dlss_ran_last_frame_;
+  // Texture mode: DLSS is told the jitter only if the scene draws really had it this frame.
+  const bool texture_mode = !settings.dlss_scene_texture.Get().empty();
+  const bool jittered = settings.dlss_jitter.Get() && inputs.dlss && dlss_ran_last_frame_ &&
+                        (!texture_mode || dlss_texture_jittered_draws_ > 0);
   inputs.jitter_x = jittered ? jitter_sign * dlss_jitter_[0] : 0.0f;
   inputs.jitter_y = jittered ? jitter_sign * dlss_jitter_[1] : 0.0f;
   if (dlss_view_projection_valid_) {
@@ -3870,6 +3898,16 @@ void D3D12CommandProcessor::EndDlssFrame(u32 frontbuffer_width, u32 frontbuffer_
   dlss_backbuffer_size_[0] = frontbuffer_width;
   dlss_backbuffer_size_[1] = frontbuffer_height;
   ++dlss_swaps_processed_;
+  if (dlss_texture_scene_draws_ && dlss_swaps_processed_ % 600 == 0) {
+    REXGPU_INFO("DLSS texture mode: {} scene draws, {} jittered; title camera for {} of the last "
+                "{} frames",
+                dlss_texture_scene_draws_, dlss_texture_jittered_draws_,
+                dlss_texture_cameras_found_,
+                dlss_texture_cameras_found_ + dlss_texture_cameras_missing_);
+    dlss_texture_cameras_found_ = dlss_texture_cameras_missing_ = 0;
+  }
+  dlss_texture_scene_draws_ = 0;
+  dlss_texture_jittered_draws_ = 0;
   if (dlss_scene_done_) {
     dlss_previous_view_projection_ = dlss_view_projection_;
     dlss_previous_view_projection_valid_ = dlss_view_projection_valid_;
