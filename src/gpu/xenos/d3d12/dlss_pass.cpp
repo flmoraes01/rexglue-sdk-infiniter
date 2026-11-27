@@ -87,6 +87,7 @@ DXGI_FORMAT DepthSRVFormat(DXGI_FORMAT resource_format) {
       return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
     case DXGI_FORMAT_R32_TYPELESS:
     case DXGI_FORMAT_D32_FLOAT:
+    case DXGI_FORMAT_R32_FLOAT:  // depth the texture cache decoded from a guest resolve
       return DXGI_FORMAT_R32_FLOAT;
     default:
       return DXGI_FORMAT_UNKNOWN;
@@ -94,8 +95,14 @@ DXGI_FORMAT DepthSRVFormat(DXGI_FORMAT resource_format) {
 }
 
 DXGI_FORMAT TypedColorFormat(DXGI_FORMAT resource_format) {
-  return resource_format == DXGI_FORMAT_R8G8B8A8_TYPELESS ? DXGI_FORMAT_R8G8B8A8_UNORM
-                                                          : resource_format;
+  switch (resource_format) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+      return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:  // HDR scene colour loaded by the texture cache
+      return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    default:
+      return resource_format;
+  }
 }
 
 }  // namespace
