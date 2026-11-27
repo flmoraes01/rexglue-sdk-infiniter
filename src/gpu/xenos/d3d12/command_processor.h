@@ -554,6 +554,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool dlss_view_projection_valid_ = false;
   bool dlss_previous_view_projection_valid_ = false;
   bool dlss_scene_done_ = false;
+  // Texture mode: linear colour over the stored one, from the scene texture's resolve exponent
+  // bias (a fixed-point texture holds the HDR scene scaled down).
+  f32 dlss_scene_color_scale_ = 1.0f;
   // Texture mode.
   u64 dlss_swaps_processed_ = 0;
   u32 dlss_texture_scene_draws_ = 0;

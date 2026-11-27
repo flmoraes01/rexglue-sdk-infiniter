@@ -15,6 +15,7 @@
 #include <rex/logging/log_category.h>
 
 #include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/cas_cs.h"
+#include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/dlss_color_scale_cs.h"
 #include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/dlss_inputs_cs.h"
 #include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/dlss_nr_compose_cs.h"
 #include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/smaa_blend_cs.h"
@@ -98,8 +99,10 @@ DXGI_FORMAT TypedColorFormat(DXGI_FORMAT resource_format) {
   switch (resource_format) {
     case DXGI_FORMAT_R8G8B8A8_TYPELESS:
       return DXGI_FORMAT_R8G8B8A8_UNORM;
-    case DXGI_FORMAT_R16G16B16A16_TYPELESS:  // HDR scene colour loaded by the texture cache
-      return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    // The texture cache keeps 16_16_16_16 (fixed point) typeless for its signed and unsigned
+    // views; the scene resolve writes it unsigned. Float textures get a typed float resource.
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+      return DXGI_FORMAT_R16G16B16A16_UNORM;
     default:
       return resource_format;
   }
@@ -147,7 +150,11 @@ bool DlssPass::Initialize(ID3D12Device* device) {
                                                           root_signature_.Get()));
   cas_pipeline_.Attach(objects::CreateComputePipeline(device, kCasCS, sizeof(kCasCS),
                                                       root_signature_.Get()));
-  if (!inputs_pipeline_ || !compose_pipeline_ || !cas_pipeline_ || !InitializeSmaa() ||
+  scale_pipeline_.Attach(objects::CreateComputePipeline(device, kDlssColorScaleCS,
+                                                        sizeof(kDlssColorScaleCS),
+                                                        root_signature_.Get()));
+  if (!inputs_pipeline_ || !compose_pipeline_ || !cas_pipeline_ || !scale_pipeline_ ||
+      !InitializeSmaa() ||
       !InitializeGi()) {
     REXGPU_WARN("DLSS: cannot create the compute pipelines");
     return false;
@@ -343,6 +350,9 @@ void DlssPass::Shutdown() {
   ngx_initialized_ = false;
   available_ = false;
   color_out_.Reset();
+  exposure_.Reset();
+  exposure_rtv_heap_.Reset();
+  exposure_ready_ = false;
   depth_out_.Reset();
   motion_out_.Reset();
   nr_out_.Reset();
@@ -350,6 +360,9 @@ void DlssPass::Shutdown() {
   stats_zero_.Reset();
   sharpen_out_.Reset();
   gi_out_.Reset();
+  scene_hdr_.Reset();
+  scene_ldr_.Reset();
+  scale_pipeline_.Reset();
   gi_pipeline_.Reset();
   gi_root_signature_.Reset();
   for (u32 i = 0; i < kFrameGenerationSlots; ++i) {
@@ -587,6 +600,23 @@ void DlssPass::Sharpen(ID3D12GraphicsCommandList* command_list, f32 sharpness, u
   command_list->SetComputeRootDescriptorTable(1, GpuDescriptor(source_slot));
   command_list->SetComputeRootDescriptorTable(2, GpuDescriptor(kSlotSharpenUAV));
   command_list->Dispatch((width + 15) / 16, (height + 15) / 16, 1);
+}
+
+void DlssPass::ScaleColor(ID3D12GraphicsCommandList* command_list, u32 source_slot, u32 x, u32 y,
+                          u32 dest_uav_slot, u32 width, u32 height, f32 scale) {
+  struct {
+    u32 origin[2];
+    u32 size[2];
+    f32 scale;
+  } constants = {{x, y}, {width, height}, scale};
+  ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
+  command_list->SetDescriptorHeaps(1, heaps);
+  command_list->SetComputeRootSignature(root_signature_.Get());
+  command_list->SetPipelineState(scale_pipeline_.Get());
+  command_list->SetComputeRoot32BitConstants(0, sizeof(constants) / sizeof(u32), &constants, 0);
+  command_list->SetComputeRootDescriptorTable(1, GpuDescriptor(source_slot));
+  command_list->SetComputeRootDescriptorTable(2, GpuDescriptor(dest_uav_slot));
+  command_list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
 }
 
 void DlssPass::Compose(ID3D12GraphicsCommandList* command_list, const Inputs& inputs,
@@ -834,9 +864,11 @@ void DlssPass::RunSmaa(ID3D12GraphicsCommandList* command_list, ID3D12Resource* 
   barriers.Submit(command_list);
 }
 
-bool DlssPass::EnsureTextures(const Inputs& inputs, DXGI_FORMAT color_format) {
+bool DlssPass::EnsureTextures(const Inputs& inputs, DXGI_FORMAT chain_format,
+                              DXGI_FORMAT color_format) {
   if (textures_width_ == inputs.width && textures_height_ == inputs.height &&
-      textures_color_format_ == color_format && color_out_) {
+      textures_chain_format_ == chain_format && textures_color_format_ == color_format &&
+      color_out_) {
     return true;
   }
   // Sized for the whole scene, so the quality mode can change without new textures. This only
@@ -859,11 +891,12 @@ bool DlssPass::EnsureTextures(const Inputs& inputs, DXGI_FORMAT color_format) {
         &objects::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&out)));
   };
-  if (!create(color_format, color_out_) || !create(color_format, nr_out_) ||
+  if (!create(chain_format, color_out_) || !create(chain_format, nr_out_) ||
       !create(DXGI_FORMAT_R32_FLOAT, depth_out_) ||
       !create(DXGI_FORMAT_R16G16_FLOAT, motion_out_) ||
-      !create(color_format, smaa_color_) || !create(DXGI_FORMAT_R8G8_UNORM, smaa_edges_) ||
-      !create(color_format, sharpen_out_) || !create(color_format, gi_out_) ||
+      !create(chain_format, smaa_color_) || !create(DXGI_FORMAT_R8G8_UNORM, smaa_edges_) ||
+      !create(chain_format, sharpen_out_) || !create(chain_format, gi_out_) ||
+      !create(chain_format, scene_hdr_) || !create(color_format, scene_ldr_) ||
       [&] {
         for (u32 i = 0; i < kFrameGenerationSlots; ++i) {
           if (!create(DXGI_FORMAT_R32_FLOAT, fg_depth_[i]) ||
@@ -900,11 +933,19 @@ bool DlssPass::EnsureTextures(const Inputs& inputs, DXGI_FORMAT color_format) {
                                      CpuDescriptor(kSlotSmaaEdgesUAV));
   device_->CreateUnorderedAccessView(smaa_weights_.Get(), nullptr, nullptr,
                                      CpuDescriptor(kSlotSmaaWeightsUAV));
+  for (u32 slot : {kSlotSceneHdrUAV, kSlotSceneHdrUAVSpare}) {
+    device_->CreateUnorderedAccessView(scene_hdr_.Get(), nullptr, nullptr, CpuDescriptor(slot));
+  }
+  device_->CreateShaderResourceView(scene_hdr_.Get(), nullptr, CpuDescriptor(kSlotSceneHdrSRV));
+  for (u32 slot : {kSlotSceneLdrUAV, kSlotSceneLdrUAVSpare}) {
+    device_->CreateUnorderedAccessView(scene_ldr_.Get(), nullptr, nullptr, CpuDescriptor(slot));
+  }
   // SMAA's colour copy rests readable; the others rest writable like every working texture.
   smaa_color_needs_transition_ = true;
   fg_textures_readable_ = false;
   textures_width_ = inputs.width;
   textures_height_ = inputs.height;
+  textures_chain_format_ = chain_format;
   textures_color_format_ = color_format;
   return true;
 }
@@ -944,7 +985,7 @@ bool DlssPass::EnsureFsrContext(const Inputs& inputs) {
 #if REX_FFX
   // The context is sized for the largest rendered and output sizes; the quality mode only
   // changes the render size passed per dispatch, so it does not need a new context.
-  const DlssKey key = {inputs.width, inputs.height, inputs.width, inputs.height, 0, 0};
+  const DlssKey key = {inputs.width, inputs.height, inputs.width, inputs.height, 0, 0, false};
   if (fsr_context_ && fsr_key_ == key) {
     return true;
   }
@@ -1017,8 +1058,11 @@ bool DlssPass::DispatchFsr(ID3D12GraphicsCommandList* command_list, const Inputs
 
 bool DlssPass::EnsureDlssFeature(ID3D12GraphicsCommandList* command_list, const Inputs& inputs) {
 #if REX_DLSS
-  const DlssKey key = {inputs.width,        inputs.height,   inputs.render_width,
-                       inputs.render_height, inputs.quality, inputs.preset};
+  // A float chain is linear HDR (values above 1); DLSS treats colour as [0, 1] otherwise. Exposure
+  // is a fixed 1 (exposure_): auto exposure makes the transformer models pump.
+  const bool hdr = textures_chain_format_ == DXGI_FORMAT_R16G16B16A16_FLOAT;
+  const DlssKey key = {inputs.width,         inputs.height,   inputs.render_width,
+                       inputs.render_height, inputs.quality, inputs.preset, hdr};
   if (feature_ && feature_key_ == key) {
     return true;
   }
@@ -1044,13 +1088,7 @@ bool DlssPass::EnsureDlssFeature(ID3D12GraphicsCommandList* command_list, const 
   create_params.Feature.InPerfQualityValue =
       static_cast<NVSDK_NGX_PerfQuality_Value>(inputs.quality);
   create_params.InFeatureCreateFlags =
-      NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
-  // A float scene is linear HDR (values above 1); DLSS treats colour as [0, 1] otherwise.
-  const DXGI_FORMAT color_format = TypedColorFormat(inputs.color->GetDesc().Format);
-  if (color_format == DXGI_FORMAT_R16G16B16A16_FLOAT || color_format == DXGI_FORMAT_R11G11B10_FLOAT ||
-      color_format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
-    create_params.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
-  }
+      NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | (hdr ? NVSDK_NGX_DLSS_Feature_Flags_IsHDR : 0);
   NVSDK_NGX_Result result =
       NGX_D3D12_CREATE_DLSS_EXT(command_list, 1, 1, &feature_, parameters_, &create_params);
   if (NVSDK_NGX_FAILED(result) || !feature_) {
@@ -1096,7 +1134,10 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
     failed_ = true;
     return;
   }
-  if (!EnsureTextures(inputs, color_format)) {
+  // A scaled (fixed-point) scene runs the chain on a linear float copy.
+  const bool scaled = inputs.color_scale != 1.0f;
+  const DXGI_FORMAT chain_format = scaled ? DXGI_FORMAT_R16G16B16A16_FLOAT : color_format;
+  if (!EnsureTextures(inputs, chain_format, color_format)) {
     failed_ = true;
     return;
   }
@@ -1214,6 +1255,17 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
   u32 current_slot = kSlotSceneSRV;
   u32 current_x = inputs.color_x;
   u32 current_y = inputs.color_y;
+  bool scene_hdr_read = false;
+  if (scaled) {
+    ScaleColor(command_list, kSlotSceneSRV, current_x, current_y, kSlotSceneHdrUAV,
+               inputs.render_width, inputs.render_height, inputs.color_scale);
+    barriers.Add(scene_hdr_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kShaderRead);
+    barriers.Submit(command_list);
+    scene_hdr_read = true;
+    current = scene_hdr_.Get();
+    current_slot = kSlotSceneHdrSRV;
+    current_x = current_y = 0;
+  }
   bool nr_out_read = false;
   bool color_out_read = false;
   auto run_nr_step = [&](u32 width, u32 height) {
@@ -1307,7 +1359,39 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
     current_slot = kSlotColorOutSRV;
     current_x = current_y = 0;
   } else if (dlss) {
+    if (!exposure_ready_) {
+      // Exposure 1 once: a 1x1 render target cleared to 1, then left readable.
+      D3D12_RESOURCE_DESC desc = {};
+      desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      desc.Width = 1;
+      desc.Height = 1;
+      desc.DepthOrArraySize = 1;
+      desc.MipLevels = 1;
+      desc.Format = DXGI_FORMAT_R32_FLOAT;
+      desc.SampleDesc.Count = 1;
+      desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+      D3D12_HEAP_PROPERTIES heap = {};
+      heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+      const D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                                   D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+      if (SUCCEEDED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                     D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                     IID_PPV_ARGS(&exposure_))) &&
+          SUCCEEDED(device_->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&exposure_rtv_heap_)))) {
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+            exposure_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+        device_->CreateRenderTargetView(exposure_.Get(), nullptr, rtv);
+        const f32 one[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        command_list->ClearRenderTargetView(rtv, one, 0, nullptr);
+        barriers.Add(exposure_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderRead);
+        barriers.Submit(command_list);
+        exposure_ready_ = true;
+      }
+    }
     NVSDK_NGX_D3D12_DLSS_Eval_Params eval = {};
+    eval.pInExposureTexture = exposure_ready_ ? exposure_.Get() : nullptr;
+    eval.InPreExposure = 1.0f;
+    eval.InExposureScale = 1.0f;
     eval.Feature.pInColor = current;
     eval.Feature.pInOutput = color_out_.Get();
     eval.pInDepth = depth_out_.Get();
@@ -1355,10 +1439,27 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
   // copies (its output is the full scene); DLAA or NR alone copy when a step ran.
   barriers.Add(depth_out_.Get(), kShaderRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   barriers.Add(motion_out_.Get(), kShaderRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  bool scene_ldr_read = false;
   if (current != inputs.color) {
     const bool full = current == color_out_.Get() || current == sharpen_out_.Get() || !nr_before;
     const u32 copy_width = full ? inputs.width : nr_width;
     const u32 copy_height = full ? inputs.height : nr_height;
+    if (scaled) {
+      // Back to the scene's own encoding, clamped like the console's resolve.
+      D3D12_SHADER_RESOURCE_VIEW_DESC scale_srv = {};
+      scale_srv.Format = chain_format;
+      scale_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      scale_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      scale_srv.Texture2D.MipLevels = 1;
+      device_->CreateShaderResourceView(current, &scale_srv, CpuDescriptor(kSlotScaleSourceSRV));
+      ScaleColor(command_list, kSlotScaleSourceSRV, current_x, current_y, kSlotSceneLdrUAV,
+                 copy_width, copy_height, 1.0f / inputs.color_scale);
+      barriers.Add(scene_ldr_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kShaderRead);
+      barriers.Submit(command_list);
+      scene_ldr_read = true;
+      current = scene_ldr_.Get();
+      current_x = current_y = 0;
+    }
     barriers.Add(current, kShaderRead, D3D12_RESOURCE_STATE_COPY_SOURCE);
     barriers.Add(inputs.color, kShaderRead, D3D12_RESOURCE_STATE_COPY_DEST);
     barriers.Submit(command_list);
@@ -1386,6 +1487,12 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
   }
   if (gi_out_read) {
     barriers.Add(gi_out_.Get(), kShaderRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
+  if (scene_hdr_read) {
+    barriers.Add(scene_hdr_.Get(), kShaderRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
+  if (scene_ldr_read) {
+    barriers.Add(scene_ldr_.Get(), kShaderRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   }
   barriers.Add(inputs.depth, kShaderRead, inputs.depth_state);
   barriers.Submit(command_list);

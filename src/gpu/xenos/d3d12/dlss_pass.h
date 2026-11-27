@@ -39,6 +39,9 @@ class DlssPass {
     D3D12_RESOURCE_STATES color_state = D3D12_RESOURCE_STATE_COMMON;
     u32 color_x = 0;
     u32 color_y = 0;
+    // Linear colour is the stored colour times this (a resolve exponent bias, for a fixed-point
+    // scene texture). Above 1 the chain runs on a linear float copy and DLSS in HDR mode.
+    f32 color_scale = 1.0f;
     ID3D12Resource* depth = nullptr;  // scene depth render target
     D3D12_RESOURCE_STATES depth_state = D3D12_RESOURCE_STATE_COMMON;
     u32 depth_x = 0;
@@ -119,10 +122,15 @@ class DlssPass {
  private:
   struct DlssKey {
     u32 width, height, render_width, render_height, quality, preset;
+    bool hdr;
     bool operator==(const DlssKey&) const = default;
   };
 
-  bool EnsureTextures(const Inputs& inputs, DXGI_FORMAT color_format);
+  // chain_format: the working textures; color_format: the scene's own (scene_ldr_).
+  bool EnsureTextures(const Inputs& inputs, DXGI_FORMAT chain_format, DXGI_FORMAT color_format);
+  // width x height of the texture in `source_slot` at (x, y), times `scale`, into `dest_uav_slot`.
+  void ScaleColor(ID3D12GraphicsCommandList* command_list, u32 source_slot, u32 x, u32 y,
+                  u32 dest_uav_slot, u32 width, u32 height, f32 scale);
   bool InitializeSmaa();
   bool InitializeGi();
   void UploadSmaaTables(ID3D12GraphicsCommandList* command_list);
@@ -172,6 +180,12 @@ class DlssPass {
     kSlotGiOutSRV,
     kSlotSharpenUAV,       // CAS: u0, u1 (u1 unused)
     kSlotSharpenUAVSpare,
+    kSlotSceneHdrUAV,      // colour scale: u0, u1 (u1 unused)
+    kSlotSceneHdrUAVSpare,
+    kSlotSceneHdrSRV,
+    kSlotSceneLdrUAV,      // colour scale back: u0, u1 (u1 unused)
+    kSlotSceneLdrUAVSpare,
+    kSlotScaleSourceSRV,   // colour scale back: the chain's result
     kSlotCount,
   };
 
@@ -188,6 +202,11 @@ class DlssPass {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> inputs_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> compose_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> cas_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> scale_pipeline_;
+  // The scene as linear float (Inputs::color_scale above 1), and the result back in the scene's
+  // own format before the copy into it.
+  Microsoft::WRL::ComPtr<ID3D12Resource> scene_hdr_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> scene_ldr_;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> gi_root_signature_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> gi_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12Resource> gi_out_;
@@ -195,6 +214,10 @@ class DlssPass {
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap_;
   u32 descriptor_size_ = 0;
   Microsoft::WRL::ComPtr<ID3D12Resource> color_out_;
+  // A fixed exposure of 1 (1x1 R32_FLOAT) instead of DLSS's auto exposure.
+  Microsoft::WRL::ComPtr<ID3D12Resource> exposure_;
+  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> exposure_rtv_heap_;
+  bool exposure_ready_ = false;
   Microsoft::WRL::ComPtr<ID3D12Resource> depth_out_;
   Microsoft::WRL::ComPtr<ID3D12Resource> motion_out_;
   Microsoft::WRL::ComPtr<ID3D12Resource> nr_out_;
@@ -228,6 +251,7 @@ class DlssPass {
   u32 stats_pixels_[kStatsSlots] = {};
   u32 textures_width_ = 0;
   u32 textures_height_ = 0;
+  DXGI_FORMAT textures_chain_format_ = DXGI_FORMAT_UNKNOWN;
   DXGI_FORMAT textures_color_format_ = DXGI_FORMAT_UNKNOWN;
 
   // Neural Rendering, called through nvngx.dll_nr_forwarder.dll (the model checks its caller).

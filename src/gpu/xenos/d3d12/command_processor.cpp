@@ -3650,10 +3650,18 @@ void D3D12CommandProcessor::RunDlssOnSceneTexture(ID3D12Resource* color,
   inputs.depth_state = depth_state;
   inputs.width = width;
   inputs.height = height;
+  inputs.color_scale = dlss_scene_color_scale_;
   RecordDlssCall(std::move(call));
 }
 
 void D3D12CommandProcessor::RunDlssBeforeResolve(const draw_state::ResolveRequest& resolve_info) {
+  if (const DlssSceneTextureSpec& spec = GetDlssSceneTextureSpec();
+      spec.valid && !resolve_info.IsCopyingDepth() &&
+      static_cast<u32>(resolve_info.copy_dest_info.copy_dest_format) == spec.color_format &&
+      resolve_info.height_div_8 * 8 == spec.height) {
+    dlss_scene_color_scale_ =
+        std::ldexp(1.0f, -static_cast<i32>(resolve_info.copy_dest_info.copy_dest_exp_bias));
+  }
   if (dlss_scene_done_ || resolve_info.IsCopyingDepth() || !IsDlssActive()) {
     return;
   }
