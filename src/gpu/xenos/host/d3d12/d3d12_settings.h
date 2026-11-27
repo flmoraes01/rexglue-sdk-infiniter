@@ -150,6 +150,13 @@ class D3D12Settings : public SettingOwner {
   REX_SETTING(std::string, dlss_scene_target, "",
               "Texture mode: comma-separated COLOR_FORMAT:MSAA (MSAA * for any) of the render "
               "targets the scene is drawn to, whose draws get the DLSS jitter");
+  REX_SETTING(bool, dlss_jitter_horizontal, true,
+              "Jitter the scene horizontally for DLSS. Off for titles whose predicated tile seams "
+              "fall between pixels, where it leaves a column of stale data");
+  REX_SETTING(i32, dlss_scene_min_draws, 0,
+              "Texture mode: fewest depth-tested scene draws a frame needs for DLSS to run (logos "
+              "and menus may keep a small 3D scene)",
+              Range{0, 100000});
 };
 
 }  // namespace rex::gpu::d3d12

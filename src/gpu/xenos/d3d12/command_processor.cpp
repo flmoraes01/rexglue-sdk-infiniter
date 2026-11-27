@@ -3546,7 +3546,10 @@ void D3D12CommandProcessor::NoteDlssDraw(const Shader& vertex_shader) {
         dlss_scene_targets_.begin(), dlss_scene_targets_.end(), [&](const std::pair<u32, u32>& t) {
           return t.first == format && (t.second == UINT32_MAX || t.second == msaa);
         });
-    if (scene_draw) {
+    // Only geometry with a depth test: full-screen quads (clears, copies, composites) cover the
+    // tile exactly, and jittered they leave a column at the tile edge uncovered, with stale data.
+    const bool depth_tested = regs.Get<xenos::reg::RB_DEPTHCONTROL>().z_enable;
+    if (scene_draw && depth_tested) {
       dlss_jitter_draw_ = GetD3D12Settings().dlss_jitter.Get() && GetDlssMode().dlss &&
                           IsUpscalerSupported() && dlss_ran_last_frame_;
       dlss_texture_jittered_draws_ += dlss_jitter_draw_ ? 1 : 0;
@@ -3617,6 +3620,13 @@ void D3D12CommandProcessor::RunDlssOnSceneTexture(ID3D12Resource* color,
   if (dlss_texture_scene_draws_ == 0) {
     NoteDlssState("texture mode: no draw this frame went to gpu.d3d12.dlss_scene_target");
   }
+  // Logos and menus can keep a small 3D scene behind them; temporal AA there only adds artifacts.
+  if (dlss_texture_scene_draws_ <
+      static_cast<u32>(GetD3D12Settings().dlss_scene_min_draws.Get())) {
+    NoteDlssState(std::format("texture mode: {} scene draws, below gpu.d3d12.dlss_scene_min_draws",
+                              dlss_texture_scene_draws_));
+    return;
+  }
   // The title's camera for the frame being processed (the swaps it presented before it).
   std::array<f32, 16> view_projection;
   dlss_view_projection_valid_ = rex::gpu::GetSceneCamera(dlss_swaps_processed_, view_projection);
@@ -3624,7 +3634,12 @@ void D3D12CommandProcessor::RunDlssOnSceneTexture(ID3D12Resource* color,
     dlss_view_projection_ = view_projection;
     ++dlss_texture_cameras_found_;
   } else {
+    // No 3D camera this frame (logos, menus, loading screens drawn the same way): nothing to
+    // reconstruct, and DLSS without motion would smear the screen. The texture is left as loaded,
+    // and without a DLSS frame the next one is not jittered either.
     ++dlss_texture_cameras_missing_;
+    NoteDlssState("texture mode: no scene camera this frame (not a 3D scene)");
+    return;
   }
   auto call = std::make_unique<DlssCall>();
   call->processor = this;
@@ -3942,6 +3957,11 @@ void D3D12CommandProcessor::EndDlssFrame(u32 frontbuffer_width, u32 frontbuffer_
   dlss_phase_count_ = std::clamp(static_cast<u32>(std::ceil(8.0f / (ratio * ratio))), 8u, 64u);
   dlss_frame_index_ = dlss_frame_index_ % dlss_phase_count_ + 1;
   dlss_jitter_[0] = Halton(dlss_frame_index_, 2) - 0.5f;
+  if (!GetD3D12Settings().dlss_jitter_horizontal.Get()) {
+    // Titles drawing the scene in predicated tiles whose seams fall between pixels: a horizontal
+    // jitter leaves the seam column uncovered by both tiles, showing stale EDRAM data.
+    dlss_jitter_[0] = 0.0f;
+  }
   dlss_jitter_[1] = Halton(dlss_frame_index_, 3) - 0.5f;
 }
 
