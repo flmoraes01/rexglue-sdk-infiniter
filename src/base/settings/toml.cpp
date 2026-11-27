@@ -62,6 +62,12 @@ Result<void> SettingsRegistry::Save(const std::filesystem::path& file) const {
       if (setting->GetConstraints().no_save || setting->GetText() == setting->GetDefaultText()) {
         continue;
       }
+      // Values the title's code sets or locks are not the player's choices: writing them would
+      // freeze them in the file, which outranks the title layer on the next start.
+      const SettingLayer layer = setting->GetLayer();
+      if (layer == SettingLayer::kTitle || layer == SettingLayer::kLock) {
+        continue;
+      }
       const size_t dot = name.rfind('.');
       toml::table& table = TableFor(root, std::string_view(name).substr(0, dot));
       const std::string key = name.substr(dot + 1);
