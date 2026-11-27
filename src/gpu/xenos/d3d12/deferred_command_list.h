@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 #include <rex/assert.h>
@@ -441,6 +442,16 @@ class DeferredCommandList {
 
   void EndDebugMarker() { WriteCommand(Command::kEndDebugMarker, 0); }
 
+  /**
+   * Calls the function with the real command list when the stream executes. The function may
+   * change any command list state; the recorder must invalidate the bindings it caches.
+   */
+  void Callback(std::function<void(ID3D12GraphicsCommandList*)> function) {
+    callbacks_.push_back(std::move(function));
+    *reinterpret_cast<size_t*>(WriteCommand(Command::kCallback, sizeof(size_t))) =
+        callbacks_.size() - 1;
+  }
+
   void InsertDebugMarker(const char* label_name) {
     size_t label_len = std::strlen(label_name);
     u8* args_ptr = reinterpret_cast<u8*>(
@@ -493,6 +504,7 @@ class DeferredCommandList {
     kBeginDebugMarker,
     kEndDebugMarker,
     kInsertDebugMarker,
+    kCallback,
   };
 
   using Stream = gpu::DeferredStream<Command>;
@@ -640,6 +652,7 @@ class DeferredCommandList {
 
   /** uintmax_t gives all structures uint64_t and pointer alignment. */
   Stream command_stream_;
+  std::vector<std::function<void(ID3D12GraphicsCommandList*)>> callbacks_;
 };
 
 }  // namespace rex::gpu::d3d12

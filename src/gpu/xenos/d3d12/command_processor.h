@@ -94,6 +94,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   void PushUAVBarrier(ID3D12Resource* resource);
   void SubmitBarriers();
 
+  /** Forgets the bound command list state, after commands recorded outside the processor. */
+  void InvalidateCommandListBindings();
+
   /**
    * Finds or creates the root signature for a pipeline.
    *

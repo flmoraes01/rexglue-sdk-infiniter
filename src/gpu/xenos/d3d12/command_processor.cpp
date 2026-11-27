@@ -2759,6 +2759,26 @@ bool D3D12CommandProcessor::IssueDrawMemexportReadbackFastPath(u32 total_size) {
   return true;
 }
 
+void D3D12CommandProcessor::InvalidateCommandListBindings() {
+  ff_viewport_update_needed_ = true;
+  ff_scissor_update_needed_ = true;
+  ff_blend_factor_update_needed_ = true;
+  ff_stencil_ref_update_needed_ = true;
+  viewport_cache_valid_ = false;
+  current_guest_pipeline_ = nullptr;
+  current_external_pipeline_ = nullptr;
+  current_graphics_root_signature_ = nullptr;
+  current_graphics_root_up_to_date_ = 0;
+  if (bindless_resources_used_) {
+    deferred_command_list_.SetDescriptorHeaps(view_bindless_heap_, sampler_bindless_heap_current_);
+  } else {
+    view_bindful_heap_current_ = nullptr;
+    sampler_bindful_heap_current_ = nullptr;
+  }
+  primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  render_target_cache_->InvalidateCommandListRenderTargets();
+}
+
 void D3D12CommandProcessor::PassTimingBoundary(const char* label) {
   // Keep a query for the final stamp of the submission.
   if (!submission_open_ || pass_timing_next_query_ + 2 >= kPassTimingQueryCount) {

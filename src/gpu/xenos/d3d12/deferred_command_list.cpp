@@ -25,6 +25,7 @@ DeferredCommandList::DeferredCommandList(const D3D12CommandProcessor& command_pr
 
 void DeferredCommandList::Reset() {
   command_stream_.Clear();
+  callbacks_.clear();
 }
 
 void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
@@ -260,6 +261,9 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
       } break;
       case Command::kEndDebugMarker: {
         command_list->EndEvent();
+      } break;
+      case Command::kCallback: {
+        callbacks_[*reinterpret_cast<const size_t*>(stream)](command_list);
       } break;
       case Command::kInsertDebugMarker: {
         auto& args = *reinterpret_cast<const DebugMarkerHeader*>(stream);

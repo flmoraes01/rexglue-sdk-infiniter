@@ -6,6 +6,7 @@
  */
 
 #include <rex/gpu/output_painter.h>
+#include <rex/gpu/texture_hook.h>
 
 #include <atomic>
 
@@ -13,6 +14,7 @@ namespace rex::gpu {
 
 namespace {
 std::atomic<IOutputPainter*> g_output_painter{nullptr};
+std::atomic<ITextureLoadHook*> g_texture_load_hook{nullptr};
 }  // namespace
 
 void SetOutputPainter(IOutputPainter* painter) {
@@ -21,6 +23,14 @@ void SetOutputPainter(IOutputPainter* painter) {
 
 IOutputPainter* GetOutputPainter() {
   return g_output_painter.load(std::memory_order_acquire);
+}
+
+void SetTextureLoadHook(ITextureLoadHook* hook) {
+  g_texture_load_hook.store(hook, std::memory_order_release);
+}
+
+ITextureLoadHook* GetTextureLoadHook() {
+  return g_texture_load_hook.load(std::memory_order_acquire);
 }
 
 }  // namespace rex::gpu

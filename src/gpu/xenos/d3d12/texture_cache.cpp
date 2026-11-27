@@ -22,6 +22,8 @@
 #include "gpu/xenos/d3d12/command_processor.h"
 #include "gpu/xenos/d3d12/shared_memory.h"
 #include "gpu/xenos/d3d12/texture_cache.h"
+
+#include <rex/gpu/texture_hook.h>
 #include <rex/xenos/texture.h>
 #include <rex/xenos/fetch.h>
 #include <rex/xenos/format.h>
@@ -1795,6 +1797,25 @@ bool D3D12TextureCache::LoadHostTextureDataFromResidentMemory(Texture& texture, 
 
   command_processor_.ReleaseScratchGPUBuffer(copy_buffer, copy_buffer_state);
 
+  if (gpu::ITextureLoadHook* hook = gpu::GetTextureLoadHook();
+      hook != nullptr && level_first == 0 &&
+      hook->WantsTexture(width, height, static_cast<u32>(guest_format))) {
+    // The copies above must reach the texture before the hook reads it.
+    command_processor_.SubmitBarriers();
+    gpu::D3D12TextureLoad load;
+    load.texture = d3d12_texture.GetResource();
+    load.width = width;
+    load.height = height;
+    load.guest_format = static_cast<u32>(guest_format);
+    load.base_page = texture_key.base_page;
+    load.submission = command_processor_.GetCurrentSubmission();
+    load.completed_submission = command_processor_.GetCompletedSubmission();
+    command_list.Callback([hook, load](ID3D12GraphicsCommandList* list) mutable {
+      load.command_list = list;
+      hook->OnTextureLoadedD3D12(load);
+    });
+    command_processor_.InvalidateCommandListBindings();
+  }
   return true;
 }
 
