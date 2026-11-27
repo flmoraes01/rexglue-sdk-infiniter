@@ -3549,9 +3549,12 @@ void D3D12CommandProcessor::NoteDlssDraw(const Shader& vertex_shader) {
     // Only geometry with a depth test: full-screen quads (clears, copies, composites) cover the
     // tile exactly, and jittered they leave a column at the tile edge uncovered, with stale data.
     const bool depth_tested = regs.Get<xenos::reg::RB_DEPTHCONTROL>().z_enable;
+    // Geometry given in screen pixels (no viewport transform) is not projected by the camera and
+    // stays put: jittered, it leaves columns of stale data where its pieces meet.
+    const bool projected = regs.Get<xenos::reg::PA_CL_VTE_CNTL>().vport_x_scale_ena;
     if (scene_draw && depth_tested) {
-      dlss_jitter_draw_ = GetD3D12Settings().dlss_jitter.Get() && GetDlssMode().dlss &&
-                          IsUpscalerSupported() && dlss_ran_last_frame_;
+      dlss_jitter_draw_ = projected && GetD3D12Settings().dlss_jitter.Get() &&
+                          GetDlssMode().dlss && IsUpscalerSupported() && dlss_ran_last_frame_;
       dlss_texture_jittered_draws_ += dlss_jitter_draw_ ? 1 : 0;
       ++dlss_texture_scene_draws_;
     }
@@ -3965,11 +3968,6 @@ void D3D12CommandProcessor::EndDlssFrame(u32 frontbuffer_width, u32 frontbuffer_
   dlss_phase_count_ = std::clamp(static_cast<u32>(std::ceil(8.0f / (ratio * ratio))), 8u, 64u);
   dlss_frame_index_ = dlss_frame_index_ % dlss_phase_count_ + 1;
   dlss_jitter_[0] = Halton(dlss_frame_index_, 2) - 0.5f;
-  if (!GetD3D12Settings().dlss_jitter_horizontal.Get()) {
-    // Titles drawing the scene in predicated tiles whose seams fall between pixels: a horizontal
-    // jitter leaves the seam column uncovered by both tiles, showing stale EDRAM data.
-    dlss_jitter_[0] = 0.0f;
-  }
   dlss_jitter_[1] = Halton(dlss_frame_index_, 3) - 0.5f;
 }
 
