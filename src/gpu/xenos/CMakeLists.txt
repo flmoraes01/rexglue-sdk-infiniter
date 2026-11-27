@@ -212,8 +212,10 @@ if (REXGLUE_GPU_D3D12)
   set(REXGLUE_DLSS_SDK "" CACHE PATH "NVIDIA DLSS SDK directory (optional)")
   if (REXGLUE_DLSS_SDK AND EXISTS "${REXGLUE_DLSS_SDK}/include/nvsdk_ngx.h")
     target_include_directories(rexgpu-xenos-d3d12 PRIVATE "${REXGLUE_DLSS_SDK}/include")
-    target_link_libraries(rexgpu-xenos-d3d12
-                          PRIVATE "${REXGLUE_DLSS_SDK}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+    # The debug library matches the Debug CRT (_ITERATOR_DEBUG_LEVEL).
+    target_link_libraries(
+      rexgpu-xenos-d3d12
+      PRIVATE "${REXGLUE_DLSS_SDK}/lib/Windows_x86_64/x64/nvsdk_ngx_d$<$<CONFIG:Debug>:_dbg>.lib")
     target_compile_definitions(rexgpu-xenos-d3d12 PRIVATE REX_DLSS=1)
     message(STATUS "DLSS: enabled from ${REXGLUE_DLSS_SDK}")
   endif ()
