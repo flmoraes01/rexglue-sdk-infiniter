@@ -16,6 +16,7 @@
 
 #include "gpu/xenos/host/d3d12/d3d12_api.h"
 #include "gpu/xenos/host/d3d12/d3d12_settings.h"
+#include "gpu/xenos/host/d3d12/frame_generation_exchange.h"
 #include "gpu/xenos/host/graphics_provider.h"
 
 namespace rex::gpu::d3d12 {
@@ -51,6 +52,8 @@ class D3D12Provider : public GraphicsProvider {
   IDXGraphicsAnalysis* GetGraphicsAnalysis() const { return graphics_analysis_; }
   ID3D12Device* GetDevice() const { return device_; }
   ID3D12CommandQueue* GetDirectQueue() const { return direct_queue_; }
+  /** Per-frame frame generation inputs, from the scene pass to the presenter. */
+  FrameGenerationExchange& GetFrameGenerationExchange() const { return frame_generation_exchange_; }
 
   u32 GetDescriptorSize(D3D12_DESCRIPTOR_HEAP_TYPE type) const { return descriptor_sizes_[type]; }
   u32 GetViewDescriptorSize() const {
@@ -122,6 +125,7 @@ class D3D12Provider : public GraphicsProvider {
   }
 
  private:
+  mutable FrameGenerationExchange frame_generation_exchange_;
   const D3D12Settings* settings_ = nullptr;
 
   static bool EnableIncreaseBasePriorityPrivilege();

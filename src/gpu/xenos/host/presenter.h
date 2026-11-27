@@ -71,6 +71,14 @@ class XenosGraphicsDriverBase;
 class REX_GPU_XENOS_API Presenter : public gpu::IPresenter {
  public:
   /**
+   * Highest rate, in Hz, the title should render at, or 0 for no limit. Frame generation sets it
+   * to half the display's refresh: Present waits for the generated frame, so frames rendered
+   * faster than that are never shown and only take GPU time from the generation.
+   */
+  f32 GetTitleFrameRateCap() const { return title_frame_rate_cap_.load(std::memory_order_relaxed); }
+  void SetTitleFrameRateCap(f32 hz) { title_frame_rate_cap_.store(hz, std::memory_order_relaxed); }
+
+  /**
    * Called on host GPU loss.
    *
    * May run on the UI thread even when statically_from_ui_thread is false, such as when the UI
@@ -367,6 +375,8 @@ class REX_GPU_XENOS_API Presenter : public gpu::IPresenter {
   bool GetPaintConnectionVsync() const { return surface_paint_connection_vsync_; }
 
  private:
+  std::atomic<f32> title_frame_rate_cap_{0.0f};
+
   enum class PaintMode : u8 {
     /**
      * Does not paint, and the painting lifecycle is UI thread only.

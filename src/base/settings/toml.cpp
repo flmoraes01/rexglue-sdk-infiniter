@@ -55,22 +55,41 @@ Result<void> CollectLeaves(const toml::table& table, const std::string& prefix,
 }  // namespace
 
 Result<void> SettingsRegistry::Save(const std::filesystem::path& file) const {
+  // Starts from the file as it is, so keys this run does not own survive: values overridden by the
+  // environment or the command line keep the file's text instead of the one-off value, and keys
+  // with no registered setting are kept.
   toml::table root;
+  std::error_code exists_ec;
+  if (std::filesystem::exists(file, exists_ec)) {
+    try {
+      root = toml::parse_file(file.string());
+    } catch (const toml::parse_error&) {
+      root = toml::table();
+    }
+  }
   {
     std::lock_guard lock(state_->mutex);
     for (auto& [name, setting] : state_->settings) {
-      if (setting->GetConstraints().no_save || setting->GetText() == setting->GetDefaultText()) {
+      if (setting->GetConstraints().no_save) {
         continue;
       }
-      // Values the title's code sets or locks are not the player's choices: writing them would
-      // freeze them in the file, which outranks the title layer on the next start.
       const SettingLayer layer = setting->GetLayer();
-      if (layer == SettingLayer::kTitle || layer == SettingLayer::kLock) {
+      if (layer == SettingLayer::kEnvironment || layer == SettingLayer::kCommandLine ||
+          layer == SettingLayer::kLock) {
         continue;
       }
       const size_t dot = name.rfind('.');
-      toml::table& table = TableFor(root, std::string_view(name).substr(0, dot));
       const std::string key = name.substr(dot + 1);
+      // Defaults and values set by the title's code are not the player's: drop any stale entry.
+      if (layer == SettingLayer::kDefault || layer == SettingLayer::kTitle ||
+          setting->GetText() == setting->GetDefaultText()) {
+        toml::node* node = root.at_path(std::string_view(name).substr(0, dot)).node();
+        if (toml::table* table = node ? node->as_table() : nullptr) {
+          table->erase(key);
+        }
+        continue;
+      }
+      toml::table& table = TableFor(root, std::string_view(name).substr(0, dot));
       const std::string text = setting->GetText();
       switch (setting->GetType()) {
         case SettingType::kBool:

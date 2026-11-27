@@ -332,7 +332,13 @@ class PipelineCache {
   bool PrepareRuntimeDescriptionForQueuedCreation(Pipeline* pipeline,
                                                   PipelineRuntimeDescription& runtime_description);
 
+  /** Reports whether gpu.xenos.text_sharpen applies to a pixel shader. */
+  bool IsTextSharpened(u64 ucode_data_hash) const;
+
   D3D12CommandProcessor& command_processor_;
+  // gpu.xenos.text_sharpen_shaders, parsed when its text changes.
+  mutable std::string text_sharpen_shaders_text_;
+  mutable std::vector<u64> text_sharpen_shaders_;
   const xenos::RegisterFile& register_file_;
   const D3D12RenderTargetCache& render_target_cache_;
   bool bindless_resources_used_;
@@ -397,6 +403,8 @@ class PipelineCache {
 
   void CreationThread(size_t thread_index);
   void CreateQueuedPipelinesOnProcessorThread();
+  // Counts a created pipeline toward the shader storage progress while the storage loads.
+  static void NoteStoragePipelineCreated();
   std::mutex creation_request_lock_;
   std::condition_variable creation_request_cond_;
   /** Protected with creation_request_lock_, notify_one creation_request_cond_ when set. */

@@ -14,6 +14,7 @@
 #include <chrono>
 #include <format>
 #include <cstdio>
+#include <cmath>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -24,6 +25,7 @@
 #include <rex/assert.h>
 #include <rex/platform/perf.h>
 #include "gpu/xenos/d3d12/command_processor.h"
+#include "gpu/xenos/host/d3d12/streamline_runtime.h"
 #include "gpu/xenos/physical_memory.h"
 #include "gpu/xenos/d3d12/d3d12_xenos_graphics_driver.h"
 #include "gpu/xenos/d3d12/shader.h"
@@ -1550,6 +1552,8 @@ bool D3D12CommandProcessor::SetupContext() {
 void D3D12CommandProcessor::ShutdownContext() {
   window_title_state_.store(0, std::memory_order_release);
   AwaitAllQueueOperationsCompletion();
+  dlss_pass_.Shutdown();
+  dlss_calls_.clear();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -1821,6 +1825,11 @@ void D3D12CommandProcessor::IssueSwap([[maybe_unused]] u32 frontbuffer_ptr, u32 
 
   if (!graphics_system_)
     return;
+  if (render_target_cache_) {
+    render_target_cache_->EndFrameResolveTrace(frame_current_, frontbuffer_ptr, frontbuffer_width,
+                                               frontbuffer_height);
+  }
+  EndDlssFrame(frontbuffer_width, frontbuffer_height);
   gpu::Presenter* presenter = graphics_system_->GetHostPresenter();
   if (!presenter) {
     REXGPU_ERROR("IssueSwap: presenter is null");
@@ -2180,6 +2189,9 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
   if (edram_mode == xenos::EDRAMMode::kCopy) {
     return IssueCopy();
   }
+  if (render_target_cache_) {
+    render_target_cache_->NoteDrawForResolveTrace();
+  }
 
   bool surface_pitch_is_zero = regs.Get<xenos::reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
@@ -2225,6 +2237,44 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
     }
   }
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
+
+  if (render_target_cache_ && GetXenosSettings().log_resolves.Get() &&
+      GetXenosSettings().log_resolve_draws.Get()) {
+    std::string line = std::format(
+        "draw VS {:016X} PS {:016X} z {} blend0 {:08X}", vertex_shader->GetUcodeDataHash(),
+        pixel_shader ? pixel_shader->GetUcodeDataHash() : 0,
+        static_cast<u32>(draw_state::GetNormalizedDepthControl(regs).z_enable),
+        regs.Get<xenos::reg::RB_BLENDCONTROL>(xenos::Register::RB_BLENDCONTROL0).value);
+    if (pixel_shader) {
+      u32 seen = 0;
+      for (const Shader::TextureBinding& binding : pixel_shader->GetTextureBindings()) {
+        if (seen & (1u << binding.fetch_constant)) {
+          continue;
+        }
+        seen |= 1u << binding.fetch_constant;
+        const xenos::TextureFetch fetch = regs.GetTextureFetch(binding.fetch_constant);
+        const u32 format = static_cast<u32>(fetch.format);
+        const u32 width = fetch.size_2d.width + 1;
+        const u32 height = fetch.size_2d.height + 1;
+        const u32 mag = static_cast<u32>(fetch.mag_filter);
+        line += std::format(" | t{} fmt {} {}x{} @{:08X} mag {}", binding.fetch_constant, format,
+                            width, height, static_cast<u32>(fetch.base_address) << 12, mag);
+      }
+    }
+    if (GetXenosSettings().log_draw_constants.Get()) {
+      const Shader::ConstantRegisterMap& map = vertex_shader->GetConstantRegisterMap();
+      line += " | c";
+      for (u32 i = 0; i < 256; ++i) {
+        if (!(map.float_bitmap[i >> 6] & (u64{1} << (i & 63)))) {
+          continue;
+        }
+        const u32 reg = std::to_underlying(xenos::Register::SHADER_CONSTANT_000_X) + (i << 2);
+        line += std::format(" {}:{:g},{:g},{:g},{:g}", i, regs.Get<f32>(reg),
+                            regs.Get<f32>(reg + 1), regs.Get<f32>(reg + 2), regs.Get<f32>(reg + 3));
+      }
+    }
+    render_target_cache_->TraceDraw(line, pixel_shader ? pixel_shader->GetUcodeDataHash() : 0);
+  }
 
   if (!BeginSubmission(true)) {
     return false;
@@ -2285,6 +2335,7 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
                                     normalized_color_mask, *vertex_shader)) {
     return false;
   }
+  NoteDlssDraw(*vertex_shader);
 
   // Translation precedes the pipeline, which needs the used textures and render target formats.
   D3D12Shader::D3D12Translation* vertex_shader_translation =
@@ -3272,6 +3323,526 @@ void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HR
   }
 }
 
+namespace {
+
+// Halton low-discrepancy sequence, the usual temporal jitter pattern.
+f32 Halton(u32 index, u32 base) {
+  f32 fraction = 1.0f;
+  f32 result = 0.0f;
+  while (index) {
+    fraction /= static_cast<f32>(base);
+    result += fraction * static_cast<f32>(index % base);
+    index /= base;
+  }
+  return result;
+}
+
+// Inverts a row-major 4x4 matrix; false when it is singular.
+bool InvertMatrix4(const std::array<f32, 16>& in, std::array<f32, 16>& out) {
+  f64 a[4][8];
+  for (u32 r = 0; r < 4; ++r) {
+    for (u32 c = 0; c < 4; ++c) {
+      a[r][c] = in[r * 4 + c];
+      a[r][c + 4] = r == c ? 1.0 : 0.0;
+    }
+  }
+  for (u32 c = 0; c < 4; ++c) {
+    u32 pivot = c;
+    for (u32 r = c + 1; r < 4; ++r) {
+      if (std::abs(a[r][c]) > std::abs(a[pivot][c])) {
+        pivot = r;
+      }
+    }
+    if (std::abs(a[pivot][c]) < 1.0e-12) {
+      return false;
+    }
+    if (pivot != c) {
+      for (u32 k = 0; k < 8; ++k) {
+        std::swap(a[c][k], a[pivot][k]);
+      }
+    }
+    const f64 inverse_pivot = 1.0 / a[c][c];
+    for (u32 k = 0; k < 8; ++k) {
+      a[c][k] *= inverse_pivot;
+    }
+    for (u32 r = 0; r < 4; ++r) {
+      if (r != c) {
+        const f64 factor = a[r][c];
+        for (u32 k = 0; k < 8; ++k) {
+          a[r][k] -= factor * a[c][k];
+        }
+      }
+    }
+  }
+  for (u32 r = 0; r < 4; ++r) {
+    for (u32 c = 0; c < 4; ++c) {
+      out[r * 4 + c] = static_cast<f32>(a[r][c + 4]);
+    }
+  }
+  return true;
+}
+
+std::array<f32, 16> MultiplyMatrix4(const std::array<f32, 16>& a, const std::array<f32, 16>& b) {
+  std::array<f32, 16> out{};
+  for (u32 r = 0; r < 4; ++r) {
+    for (u32 c = 0; c < 4; ++c) {
+      f32 sum = 0.0f;
+      for (u32 k = 0; k < 4; ++k) {
+        sum += a[r * 4 + k] * b[k * 4 + c];
+      }
+      out[r * 4 + c] = sum;
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+D3D12CommandProcessor::DlssMode D3D12CommandProcessor::GetDlssMode() const {
+  const std::string& mode = GetD3D12Settings().dlss.Get();
+  // NVSDK_NGX_PerfQuality_Value: 0 MaxPerf, 1 Balanced, 2 MaxQuality, 5 DLAA.
+  if (mode == "dlaa") {
+    return {true, 5, 1.0f};
+  }
+  if (mode == "quality") {
+    return {true, 2, 2.0f / 3.0f};
+  }
+  if (mode == "balanced") {
+    return {true, 1, 0.58f};
+  }
+  if (mode == "performance") {
+    return {true, 0, 0.5f};
+  }
+  if (mode == "smaa") {
+    return {false, 5, 1.0f, true};
+  }
+  return {};
+}
+
+bool D3D12CommandProcessor::IsDlssCameraCut(const std::array<f32, 16>& reproject) {
+  // Reproject a grid of screen points at near and far depths; a cut moves them by more than a
+  // quarter of the screen, or puts them behind the previous camera.
+  for (f32 depth : {0.9f, 0.999f}) {
+    for (f32 y : {-0.5f, 0.0f, 0.5f}) {
+      for (f32 x : {-0.5f, 0.0f, 0.5f}) {
+        const f32 v[4] = {x, y, depth, 1.0f};
+        f32 p[4] = {};
+        for (u32 c = 0; c < 4; ++c) {
+          for (u32 r = 0; r < 4; ++r) {
+            p[c] += v[r] * reproject[r * 4 + c];
+          }
+        }
+        if (p[3] <= 1.0e-6f) {
+          return true;
+        }
+        if (std::abs(p[0] / p[3] - x) > 0.5f || std::abs(p[1] / p[3] - y) > 0.5f) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+bool D3D12CommandProcessor::IsUpscalerSupported() {
+  return GetD3D12Settings().upscaler.Get() == "fsr" ? dlss_pass_.IsFsrSupported()
+                                                     : dlss_pass_.IsDlssSupported();
+}
+
+u32 D3D12CommandProcessor::DlssRenderSize(u32 size, f32 ratio) {
+  return std::max(u32(1), static_cast<u32>(std::lround(static_cast<f32>(size) * ratio)));
+}
+
+bool D3D12CommandProcessor::IsDlssActive() {
+  const D3D12Settings& settings = GetD3D12Settings();
+  const DlssMode active_mode = GetDlssMode();
+  if ((!active_mode.dlss && !active_mode.smaa && !settings.dlss_nr.Get() &&
+       settings.sharpening.Get() <= 0.0 && settings.frame_generation.Get() == "off" &&
+       !settings.ssgi.Get()) ||
+      settings.dlss_scene_address.Get().empty() ||
+      render_target_cache_->GetPath() != RenderTargetCache::Path::kHostRenderTargets) {
+    return false;
+  }
+  if (!dlss_initialize_attempted_) {
+    dlss_initialize_attempted_ = true;
+    dlss_pass_.Initialize(GetD3D12Provider().GetDevice());
+  }
+  if (settings.dlss_nr.Get()) {
+    // Loads the model early (only once), so a missing file is reported before gameplay.
+    dlss_pass_.InitializeNeuralRendering();
+  }
+  if (!dlss_pass_.IsAvailable()) {
+    NoteDlssState("the DLSS pass is off (see the DLSS warning above)");
+    return false;
+  }
+  return true;
+}
+
+bool D3D12CommandProcessor::IsDlssCameraShader(u64 ucode_hash) {
+  const std::string& text = GetD3D12Settings().dlss_camera_shaders.Get();
+  if (text != dlss_camera_shaders_text_) {
+    dlss_camera_shaders_text_ = text;
+    dlss_camera_shaders_.clear();
+    size_t position = 0;
+    while (position < text.size()) {
+      size_t comma = text.find(',', position);
+      if (comma == std::string::npos) {
+        comma = text.size();
+      }
+      const std::string item = text.substr(position, comma - position);
+      if (!item.empty()) {
+        dlss_camera_shaders_.push_back(std::strtoull(item.c_str(), nullptr, 16));
+      }
+      position = comma + 1;
+    }
+  }
+  return std::find(dlss_camera_shaders_.begin(), dlss_camera_shaders_.end(), ucode_hash) !=
+         dlss_camera_shaders_.end();
+}
+
+void D3D12CommandProcessor::NoteDlssDraw(const Shader& vertex_shader) {
+  dlss_jitter_draw_ = false;
+  dlss_shrink_draw_ = false;
+  if (dlss_scene_done_ || !dlss_backbuffer_size_[0] || !IsDlssActive()) {
+    return;
+  }
+  const xenos::RegisterFile& regs = *register_file_;
+  // Scene draws cover the whole frame; shadow maps and half-resolution passes do not.
+  const auto vte = regs.Get<xenos::reg::PA_CL_VTE_CNTL>();
+  const f32 width =
+      vte.vport_x_scale_ena ? 2.0f * std::abs(regs.Get<f32>(xenos::Register::PA_CL_VPORT_XSCALE))
+                            : 0.0f;
+  const f32 height =
+      vte.vport_y_scale_ena ? 2.0f * std::abs(regs.Get<f32>(xenos::Register::PA_CL_VPORT_YSCALE))
+                            : 0.0f;
+  const u32 bound = render_target_cache_->GetLastUpdateBoundRenderTargets();
+  if ((bound & ~1u) && width * height > f32(dlss_colour_viewport_[0]) * f32(dlss_colour_viewport_[1])) {
+    dlss_colour_viewport_[0] = static_cast<u32>(width);
+    dlss_colour_viewport_[1] = static_cast<u32>(height);
+  }
+  if (std::abs(width - static_cast<f32>(dlss_backbuffer_size_[0])) < 1.0f &&
+      std::abs(height - static_cast<f32>(dlss_backbuffer_size_[1])) < 1.0f) {
+    ++dlss_full_frame_draws_[0];
+    dlss_full_frame_draws_[1] += (bound & ~1u) ? 1 : 0;
+    dlss_full_frame_draws_[2] += (bound & 1u) ? 1 : 0;
+    // Jitter and the smaller scene feed DLSS only; Neural Rendering alone sees the scene as drawn.
+    // Both wait for a frame DLSS ran on, so a screen it cannot handle is left untouched.
+    dlss_jitter_draw_ = GetD3D12Settings().dlss_jitter.Get() && GetDlssMode().dlss &&
+                        IsUpscalerSupported() && dlss_ran_last_frame_;
+    dlss_shrink_draw_ = dlss_render_ratio_ < 1.0f && dlss_ran_last_frame_;
+    render_target_cache_->NoteDlssSceneDraw();
+    // The camera comes from scene draws only: shadow passes use the same shaders with a light.
+    if (!dlss_view_projection_valid_ && IsDlssCameraShader(vertex_shader.GetUcodeDataHash())) {
+      const u32 first = std::to_underlying(xenos::Register::SHADER_CONSTANT_000_X) +
+                        static_cast<u32>(GetD3D12Settings().dlss_camera_register.Get()) * 4;
+      for (u32 i = 0; i < 16; ++i) {
+        dlss_view_projection_[i] = regs.Get<f32>(first + i);
+      }
+      dlss_view_projection_valid_ = true;
+    }
+  }
+}
+
+void D3D12CommandProcessor::RunDlssBeforeResolve(const draw_state::ResolveRequest& resolve_info) {
+  if (dlss_scene_done_ || resolve_info.IsCopyingDepth() || !IsDlssActive()) {
+    return;
+  }
+  const D3D12Settings& settings = GetD3D12Settings();
+  const u32 scene_address =
+      static_cast<u32>(std::strtoull(settings.dlss_scene_address.Get().c_str(), nullptr, 16));
+  // The scene's own resolve covers the whole back buffer. The title also clears the same address
+  // at half size at the start of the frame, which must not count as the end of the scene.
+  if (resolve_info.copy_dest_base != scene_address ||
+      resolve_info.coordinate_info.width_div_8 * 8 != dlss_backbuffer_size_[0] ||
+      resolve_info.height_div_8 * 8 != dlss_backbuffer_size_[1]) {
+    return;
+  }
+  dlss_scene_done_ = true;
+  auto call = std::make_unique<DlssCall>();
+  call->processor = this;
+  DlssPass::Inputs& inputs = call->inputs;
+  std::string why_not;
+  if (!render_target_cache_->GetDlssSceneTargets(resolve_info, inputs, why_not)) {
+    NoteDlssState(std::format("{} ({} full-frame draws, {} with colour, {} with depth; largest "
+                              "colour viewport {}x{}, back buffer {}x{})",
+                              why_not, dlss_full_frame_draws_[0], dlss_full_frame_draws_[1],
+                              dlss_full_frame_draws_[2], dlss_colour_viewport_[0],
+                              dlss_colour_viewport_[1], dlss_backbuffer_size_[0],
+                              dlss_backbuffer_size_[1]));
+    return;
+  }
+  NoteDlssState("");
+  dlss_ran_this_frame_ = true;
+  const DlssMode mode = GetDlssMode();
+  inputs.fsr = settings.upscaler.Get() == "fsr";
+  inputs.dlss = mode.dlss && IsUpscalerSupported();
+  inputs.frame_time_ms = dlss_frame_time_ms_;
+  inputs.frame_generation_camera.streamline_token = dlss_streamline_token_;
+  if (settings.frame_generation.Get() != "off") {
+    inputs.frame_generation = &GetD3D12Provider().GetFrameGenerationExchange();
+  }
+  inputs.smaa = mode.smaa;
+  inputs.sharpen = static_cast<f32>(settings.sharpening.Get());
+  inputs.gi = settings.ssgi.Get() && dlss_view_projection_valid_;
+  inputs.gi_strength = static_cast<f32>(settings.ssgi_strength.Get());
+  inputs.gi_ao_strength = static_cast<f32>(settings.ssgi_ao_strength.Get());
+  inputs.gi_radius = static_cast<f32>(settings.ssgi_radius.Get());
+  inputs.quality = mode.quality;
+  if (dlss_render_ratio_ < 1.0f) {
+    if (!dlss_ran_last_frame_) {
+      // This frame was drawn at full size; Super Resolution starts with the next one.
+      return;
+    }
+    inputs.render_width = DlssRenderSize(inputs.width, dlss_render_ratio_);
+    inputs.render_height = DlssRenderSize(inputs.height, dlss_render_ratio_);
+  } else {
+    inputs.render_width = inputs.width;
+    inputs.render_height = inputs.height;
+  }
+  // The jitter the scene was drawn with this frame (none on the first frame DLSS runs).
+  const f32 jitter_sign = settings.dlss_jitter_invert.Get() ? -1.0f : 1.0f;
+  const bool jittered = settings.dlss_jitter.Get() && inputs.dlss && dlss_ran_last_frame_;
+  inputs.jitter_x = jittered ? jitter_sign * dlss_jitter_[0] : 0.0f;
+  inputs.jitter_y = jittered ? jitter_sign * dlss_jitter_[1] : 0.0f;
+  if (dlss_view_projection_valid_) {
+    // Near, far and vertical field of view from the view-projection (row vector): the z column
+    // is a times the w column plus b in the last row, with a = f / (f - n) and b = -n a.
+    const std::array<f32, 16>& m = dlss_view_projection_;
+    u32 row = 0;
+    for (u32 r = 1; r < 3; ++r) {
+      if (std::abs(m[r * 4 + 3]) > std::abs(m[row * 4 + 3])) {
+        row = r;
+      }
+    }
+    const f32 a = m[row * 4 + 3] != 0.0f ? m[row * 4 + 2] / m[row * 4 + 3] : 0.0f;
+    const f32 b = m[14] - a * m[15];
+    if (a > 1.0f && b < 0.0f) {
+      inputs.camera_near = -b / a;
+      inputs.camera_far = a * inputs.camera_near / (a - 1.0f);
+    }
+    const f32 y_scale = std::sqrt(m[1] * m[1] + m[5] * m[5] + m[9] * m[9]);
+    if (y_scale > 0.0f) {
+      inputs.camera_fov_y = 2.0f * std::atan(1.0f / y_scale);
+    }
+    if (settings.frame_generation.Get() != "off") {
+      // World-space camera axes are the x, y and w columns; its position is where clip x, y and
+      // w are all zero (a 3x3 system, solved by Cramer's rule).
+      FrameGenerationFrame& camera = inputs.frame_generation_camera;
+      auto axis = [&](u32 column, f32* out) {
+        const f32 v[3] = {m[column], m[4 + column], m[8 + column]};
+        const f32 length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        for (u32 i = 0; i < 3; ++i) {
+          out[i] = length > 0.0f ? v[i] / length : 0.0f;
+        }
+      };
+      axis(0, camera.camera_right);
+      axis(1, camera.camera_up);
+      axis(3, camera.camera_forward);
+      const u32 columns[3] = {0, 1, 3};
+      f64 system[3][3];
+      f64 rhs[3];
+      for (u32 eq = 0; eq < 3; ++eq) {
+        for (u32 k = 0; k < 3; ++k) {
+          system[eq][k] = m[k * 4 + columns[eq]];
+        }
+        rhs[eq] = -m[12 + columns[eq]];
+      }
+      auto det3 = [](const f64 (&q)[3][3]) {
+        return q[0][0] * (q[1][1] * q[2][2] - q[1][2] * q[2][1]) -
+               q[0][1] * (q[1][0] * q[2][2] - q[1][2] * q[2][0]) +
+               q[0][2] * (q[1][0] * q[2][1] - q[1][1] * q[2][0]);
+      };
+      const f64 det = det3(system);
+      if (std::abs(det) > 1.0e-12) {
+        for (u32 k = 0; k < 3; ++k) {
+          f64 replaced[3][3];
+          for (u32 eq = 0; eq < 3; ++eq) {
+            for (u32 col = 0; col < 3; ++col) {
+              replaced[eq][col] = col == k ? rhs[eq] : system[eq][col];
+            }
+          }
+          camera.camera_position[k] = static_cast<f32>(det3(replaced) / det);
+        }
+      }
+      // View matrix from those axes (row vector: view = world * V), and the projection that,
+      // after it, gives the title's view-projection exactly: P = inverse(V) * VP.
+      std::array<f32, 16> view = {};
+      const f32* axes[3] = {camera.camera_right, camera.camera_up, camera.camera_forward};
+      for (u32 axis_index = 0; axis_index < 3; ++axis_index) {
+        f32 dot = 0.0f;
+        for (u32 r = 0; r < 3; ++r) {
+          view[r * 4 + axis_index] = axes[axis_index][r];
+          dot += axes[axis_index][r] * camera.camera_position[r];
+        }
+        view[12 + axis_index] = -dot;
+      }
+      view[15] = 1.0f;
+      std::array<f32, 16> view_inverse;
+      if (InvertMatrix4(view, view_inverse)) {
+        const std::array<f32, 16> projection = MultiplyMatrix4(view_inverse, m);
+        std::array<f32, 16> projection_inverse;
+        if (InvertMatrix4(projection, projection_inverse)) {
+          std::copy(projection.begin(), projection.end(), camera.view_to_clip);
+          std::copy(projection_inverse.begin(), projection_inverse.end(), camera.clip_to_view);
+        }
+      }
+    }
+  }
+  std::array<f32, 16> inverse;
+  if (dlss_view_projection_valid_ && dlss_previous_view_projection_valid_ &&
+      InvertMatrix4(dlss_view_projection_, inverse)) {
+    inputs.reproject = MultiplyMatrix4(inverse, dlss_previous_view_projection_);
+    std::copy(inputs.reproject.begin(), inputs.reproject.end(),
+              inputs.frame_generation_camera.clip_to_prev_clip);
+    std::array<f32, 16> reproject_inverse;
+    if (InvertMatrix4(inputs.reproject, reproject_inverse)) {
+      std::copy(reproject_inverse.begin(), reproject_inverse.end(),
+                inputs.frame_generation_camera.prev_clip_to_clip);
+    }
+    if (IsDlssCameraCut(inputs.reproject)) {
+      // A cut or a jump: the previous frame does not belong to this one, and keeping it leaves a
+      // trail of the old view in DLSS and Neural Rendering.
+      inputs.reset = true;
+    }
+  } else {
+    inputs.reproject = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    inputs.reset = true;
+  }
+  if (!dlss_ran_last_frame_) {
+    inputs.reset = true;
+  }
+  // NVSDK_NGX_DLSS_Hint_Render_Preset: E (5) is the last convolutional model, J to M transformers.
+  const std::string& preset = settings.dlss_preset.Get();
+  inputs.preset = preset == "cnn"  ? 5
+                  : preset == "J" ? 10
+                  : preset == "K" ? 11
+                  : preset == "L" ? 12
+                  : preset == "M" ? 13
+                                  : 0;
+  inputs.nr.enabled = settings.dlss_nr.Get();
+  inputs.nr.before_dlss = settings.dlss_nr_placement.Get() == "before";
+  inputs.nr_detail_strength = static_cast<f32>(settings.dlss_nr_detail_strength.Get());
+  inputs.nr_colour_strength = static_cast<f32>(settings.dlss_nr_colour_strength.Get());
+  const std::string& debug = settings.dlss_nr_debug.Get();
+  inputs.nr_debug_view = debug == "difference" ? 1 : debug == "model" ? 2 : 0;
+  const std::string& style = settings.dlss_nr_style.Get();
+  inputs.nr.style = style == "natural" ? 1 : style == "cinematic" ? 2 : 0;
+  inputs.nr.intensity = static_cast<f32>(settings.dlss_nr_intensity.Get());
+  inputs.nr.local_structure = static_cast<f32>(settings.dlss_nr_local_structure.Get());
+  inputs.nr.local_tone = static_cast<f32>(settings.dlss_nr_local_tone.Get());
+  inputs.nr.skin_structure = static_cast<f32>(settings.dlss_nr_skin_structure.Get());
+  deferred_command_list_.HostCall(&DlssHostCall, call.get());
+  dlss_calls_.push_back(std::move(call));
+  InvalidateCommandListState();
+}
+
+void D3D12CommandProcessor::DlssHostCall(void* user, ID3D12GraphicsCommandList* command_list) {
+  auto& call = *static_cast<DlssCall*>(user);
+  call.processor->dlss_pass_.Record(command_list, call.inputs);
+}
+
+void D3D12CommandProcessor::NoteDlssState(std::string state) {
+  // Compared without the per-frame counts in parentheses, and logged at most every 2 seconds:
+  // logging every frame on screens that flip between states slows the whole game down. A change
+  // held back is logged by EndDlssFrame once the 2 seconds have passed.
+  const std::string key = state.substr(0, state.find(" ("));
+  if (key == dlss_state_) {
+    return;
+  }
+  dlss_state_ = key;
+  dlss_state_message_ = std::move(state);
+  ++dlss_state_changes_unlogged_;
+  if (std::chrono::steady_clock::now() - dlss_state_logged_at_ >= std::chrono::seconds(2)) {
+    LogDlssState();
+  }
+}
+
+void D3D12CommandProcessor::LogDlssState() {
+  dlss_state_logged_at_ = std::chrono::steady_clock::now();
+  const std::string skipped =
+      dlss_state_changes_unlogged_ > 1
+          ? std::format(" [{} changes since the last line]", dlss_state_changes_unlogged_)
+          : std::string();
+  dlss_state_changes_unlogged_ = 0;
+  if (dlss_state_message_.empty()) {
+    REXGPU_INFO("DLSS: running on the scene{}", skipped);
+  } else {
+    REXGPU_INFO("DLSS: not running: {}{}", dlss_state_message_, skipped);
+  }
+}
+
+void D3D12CommandProcessor::EndDlssFrame(u32 frontbuffer_width, u32 frontbuffer_height) {
+  // Streamline's Reflex markers follow the title's frames on this thread.
+  if (StreamlineRuntime* streamline = StreamlineRuntime::Get()) {
+    streamline->EndTitleFrame(dlss_streamline_token_);
+    dlss_streamline_token_ = streamline->BeginTitleFrame();
+  }
+  if (dlss_state_changes_unlogged_ &&
+      std::chrono::steady_clock::now() - dlss_state_logged_at_ >= std::chrono::seconds(2)) {
+    LogDlssState();
+  }
+  if (!dlss_scene_done_ && dlss_initialize_attempted_ && IsDlssActive()) {
+    NoteDlssState(std::format("no colour resolve to the scene address this frame ({}x{} swap)",
+                              frontbuffer_width, frontbuffer_height));
+  }
+  dlss_backbuffer_size_[0] = frontbuffer_width;
+  dlss_backbuffer_size_[1] = frontbuffer_height;
+  if (dlss_scene_done_) {
+    dlss_previous_view_projection_ = dlss_view_projection_;
+    dlss_previous_view_projection_valid_ = dlss_view_projection_valid_;
+  }
+  dlss_view_projection_valid_ = false;
+  dlss_scene_done_ = false;
+  dlss_ran_last_frame_ = dlss_ran_this_frame_;
+  dlss_ran_this_frame_ = false;
+  dlss_jitter_draw_ = false;
+  dlss_shrink_draw_ = false;
+  dlss_colour_viewport_[0] = dlss_colour_viewport_[1] = 0;
+  dlss_full_frame_draws_[0] = dlss_full_frame_draws_[1] = dlss_full_frame_draws_[2] = 0;
+  if (render_target_cache_) {
+    render_target_cache_->ResetDlssScene();
+  }
+  // The next frame's mode. A mode change restarts DLSS from a full-size frame.
+  // Without the chosen upscaler there is nothing to upscale with: the scene stays full size.
+  const f32 ratio = IsUpscalerSupported() ? GetDlssMode().ratio : 1.0f;
+  const auto now = std::chrono::steady_clock::now();
+  if (dlss_last_frame_time_.time_since_epoch().count()) {
+    dlss_frame_time_ms_ = std::clamp(
+        std::chrono::duration<f32, std::milli>(now - dlss_last_frame_time_).count(), 0.1f, 100.0f);
+  }
+  dlss_last_frame_time_ = now;
+  if (ratio != dlss_render_ratio_) {
+    dlss_render_ratio_ = ratio;
+    dlss_ran_last_frame_ = false;
+  }
+  // Halton(2, 3) in host pixels; NVIDIA advises 8 phases times the upscale factor squared.
+  dlss_phase_count_ = std::clamp(static_cast<u32>(std::ceil(8.0f / (ratio * ratio))), 8u, 64u);
+  dlss_frame_index_ = dlss_frame_index_ % dlss_phase_count_ + 1;
+  dlss_jitter_[0] = Halton(dlss_frame_index_, 2) - 0.5f;
+  dlss_jitter_[1] = Halton(dlss_frame_index_, 3) - 0.5f;
+}
+
+void D3D12CommandProcessor::InvalidateCommandListState() {
+  // An outside pass recorded on the command list; forget every binding cached about it.
+  ff_viewport_update_needed_ = true;
+  ff_scissor_update_needed_ = true;
+  ff_blend_factor_update_needed_ = true;
+  ff_stencil_ref_update_needed_ = true;
+  viewport_cache_valid_ = false;
+  current_guest_pipeline_ = nullptr;
+  current_external_pipeline_ = nullptr;
+  current_graphics_root_signature_ = nullptr;
+  current_graphics_root_up_to_date_ = 0;
+  if (bindless_resources_used_) {
+    deferred_command_list_.SetDescriptorHeaps(view_bindless_heap_, sampler_bindless_heap_current_);
+  } else {
+    view_bindful_heap_current_ = nullptr;
+    sampler_bindful_heap_current_ = nullptr;
+  }
+  primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  render_target_cache_->InvalidateCommandListRenderTargets();
+}
+
 bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 #if REXGPU_FINE_GRAINED_DRAW_SCOPES
   REX_PROFILE_SCOPE("gpu");
@@ -3314,6 +3885,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     submission_open_ = true;
 
     deferred_command_list_.Reset();
+    dlss_calls_.clear();
 
     ff_viewport_update_needed_ = true;
     ff_scissor_update_needed_ = true;
@@ -3777,6 +4349,31 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     dirty |= system_constants_.ndc_offset[i] != viewport_info.ndc_offset[i];
     system_constants_.ndc_scale[i] = viewport_info.ndc_scale[i];
     system_constants_.ndc_offset[i] = viewport_info.ndc_offset[i];
+  }
+  if (dlss_shrink_draw_ && viewport_info.xy_extent[0] && viewport_info.xy_extent[1]) {
+    // NDC [-1, 1] lands on the top-left render_width x render_height of the viewport:
+    // x' = r x + (r - 1) w, y' = r y + (1 - r) w (y points up).
+    const f32 ratio_x =
+        f32(DlssRenderSize(viewport_info.xy_extent[0], dlss_render_ratio_)) /
+        f32(viewport_info.xy_extent[0]);
+    const f32 ratio_y =
+        f32(DlssRenderSize(viewport_info.xy_extent[1], dlss_render_ratio_)) /
+        f32(viewport_info.xy_extent[1]);
+    system_constants_.ndc_scale[0] *= ratio_x;
+    system_constants_.ndc_scale[1] *= ratio_y;
+    system_constants_.ndc_offset[0] = system_constants_.ndc_offset[0] * ratio_x + (ratio_x - 1.0f);
+    system_constants_.ndc_offset[1] = system_constants_.ndc_offset[1] * ratio_y + (1.0f - ratio_y);
+    dirty = true;
+  }
+  if (dlss_jitter_draw_ && viewport_info.xy_extent[0] && viewport_info.xy_extent[1]) {
+    // Sub-pixel jitter for DLSS: one NDC unit spans half the host viewport.
+    const f32 jitter_ndc[2] = {
+        2.0f * dlss_jitter_[0] / static_cast<f32>(viewport_info.xy_extent[0]),
+        -2.0f * dlss_jitter_[1] / static_cast<f32>(viewport_info.xy_extent[1])};
+    for (u32 i = 0; i < 2; ++i) {
+      system_constants_.ndc_offset[i] += jitter_ndc[i];
+    }
+    dirty = true;
   }
 
   if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList) {

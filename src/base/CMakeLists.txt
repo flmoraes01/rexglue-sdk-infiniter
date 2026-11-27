@@ -38,6 +38,7 @@ target_sources(
           settings/setting.cpp
           settings/settings_registry.cpp
           settings/toml.cpp
+          shader_storage_progress.cpp
           status.cpp
           string_buffer.cpp
           host_thread_registry.cpp

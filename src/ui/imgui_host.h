@@ -36,6 +36,9 @@ class ImGuiHost final {
     MoveOnlyFunction<void(bool)> set_mouse_capture;
     MoveOnlyFunction<std::string()> get_clipboard;
     MoveOnlyFunction<void(std::string_view)> set_clipboard;
+    // Runs after a dialog closed itself by returning false from Draw, which bypasses the
+    // overlay registry, so state derived from the visible dialogs can be recomputed.
+    MoveOnlyFunction<void()> dialog_closed;
   };
 
   explicit ImGuiHost(Hooks hooks);

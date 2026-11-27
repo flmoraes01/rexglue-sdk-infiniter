@@ -452,6 +452,19 @@ class DeferredCommandList {
         callbacks_.size() - 1;
   }
 
+  /**
+   * Runs host code on the real command list at this point of the stream (for passes from outside
+   * libraries, such as DLSS). The callback may change any command list state; the caller must
+   * invalidate what it caches about bindings afterwards.
+   */
+  using HostCallback = void (*)(void* user, ID3D12GraphicsCommandList* command_list);
+  void HostCall(HostCallback callback, void* user) {
+    auto& args = *reinterpret_cast<HostCallArguments*>(
+        WriteCommand(Command::kHostCall, sizeof(HostCallArguments)));
+    args.callback = callback;
+    args.user = user;
+  }
+
   void InsertDebugMarker(const char* label_name) {
     size_t label_len = std::strlen(label_name);
     u8* args_ptr = reinterpret_cast<u8*>(
@@ -503,6 +516,7 @@ class DeferredCommandList {
     kD3DSetSamplePositions,
     kBeginDebugMarker,
     kEndDebugMarker,
+    kHostCall,
     kInsertDebugMarker,
     kCallback,
   };
@@ -562,6 +576,11 @@ class DeferredCommandList {
     D3D12_TEXTURE_COPY_LOCATION src;
     D3D12_BOX src_box;
     bool has_src_box;
+  };
+
+  struct HostCallArguments {
+    HostCallback callback;
+    void* user;
   };
 
   struct D3DDispatchArguments {

@@ -66,6 +66,8 @@ if (REXGLUE_GPU_D3D12)
       d3d12/shared_memory.cpp
       d3d12/texture_cache.cpp
       d3d12/deferred_command_list.cpp
+      d3d12/dlss_pass.cpp
+      d3d12/texture_replacement.cpp
       d3d12/pipeline_cache.cpp
   )
 endif ()
@@ -102,6 +104,8 @@ if (REXGLUE_GPU_D3D12)
       host/d3d12/d3d12_descriptor_heap_pool.cpp
       host/d3d12/d3d12_immediate_drawer.cpp
       host/d3d12/d3d12_presenter.cpp
+      host/d3d12/ffx_runtime.cpp
+      host/d3d12/streamline_runtime.cpp
       host/d3d12/d3d12_provider.cpp
       host/d3d12/d3d12_submission_tracker.cpp
       host/d3d12/d3d12_upload_buffer_pool.cpp
@@ -203,6 +207,36 @@ if (REXGLUE_GPU_D3D12)
     ${REXGPU_XENOS_D3D12_ALL}
   )
   target_compile_definitions(rexgpu-xenos-d3d12 PRIVATE REX_GPU_XENOS_STATIC)
+  # NVIDIA DLSS: point REXGLUE_DLSS_SDK at a checkout of github.com/NVIDIA/DLSS (include and
+  # lib/Windows_x86_64). Without it the DLSS pass compiles to a stub.
+  set(REXGLUE_DLSS_SDK "" CACHE PATH "NVIDIA DLSS SDK directory (optional)")
+  if (REXGLUE_DLSS_SDK AND EXISTS "${REXGLUE_DLSS_SDK}/include/nvsdk_ngx.h")
+    target_include_directories(rexgpu-xenos-d3d12 PRIVATE "${REXGLUE_DLSS_SDK}/include")
+    target_link_libraries(rexgpu-xenos-d3d12
+                          PRIVATE "${REXGLUE_DLSS_SDK}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+    target_compile_definitions(rexgpu-xenos-d3d12 PRIVATE REX_DLSS=1)
+    message(STATUS "DLSS: enabled from ${REXGLUE_DLSS_SDK}")
+  endif ()
+  # AMD FidelityFX (FSR): point REXGLUE_FFX_SDK at a checkout of
+  # github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK. Only the API headers are used; the signed
+  # DLLs are loaded at run time from next to the executable.
+  set(REXGLUE_FFX_SDK "" CACHE PATH "AMD FidelityFX SDK directory (optional)")
+  if (REXGLUE_FFX_SDK AND EXISTS "${REXGLUE_FFX_SDK}/Kits/FidelityFX/api/include/ffx_api.h")
+    target_include_directories(
+      rexgpu-xenos-d3d12 PRIVATE "${REXGLUE_FFX_SDK}/Kits/FidelityFX/api/include"
+                                 "${REXGLUE_FFX_SDK}/Kits/FidelityFX/upscalers/include"
+                                 "${REXGLUE_FFX_SDK}/Kits/FidelityFX/framegeneration/include")
+    target_compile_definitions(rexgpu-xenos-d3d12 PRIVATE REX_FFX=1)
+    message(STATUS "FSR: enabled from ${REXGLUE_FFX_SDK}")
+  endif ()
+  # NVIDIA Streamline (DLSS frame generation): point REXGLUE_STREAMLINE_SDK at an unpacked
+  # Streamline SDK release. Only its headers are used; sl.interposer.dll is loaded at run time.
+  set(REXGLUE_STREAMLINE_SDK "" CACHE PATH "NVIDIA Streamline SDK directory (optional)")
+  if (REXGLUE_STREAMLINE_SDK AND EXISTS "${REXGLUE_STREAMLINE_SDK}/include/sl.h")
+    target_include_directories(rexgpu-xenos-d3d12 PRIVATE "${REXGLUE_STREAMLINE_SDK}/include")
+    target_compile_definitions(rexgpu-xenos-d3d12 PRIVATE REX_STREAMLINE=1)
+    message(STATUS "Streamline: enabled from ${REXGLUE_STREAMLINE_SDK}")
+  endif ()
   target_link_libraries(
     rexgpu-xenos-d3d12
     PRIVATE rexgpu-xenos-base

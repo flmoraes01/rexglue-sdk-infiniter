@@ -99,6 +99,31 @@ class XenosSettings : public SettingOwner {
   REX_SETTING(bool, direct_host_resolve, true,
               "Resolve from host render targets to shared memory when possible");
   REX_SETTING(bool, texture_3d_to_2d, true, "Sample 3D textures as 2D textures");
+  REX_SETTING(bool, log_resolves, false,
+              "Log each frame's render target resolves (source, format, size, destination, draws "
+              "before it) when the sequence changes. For finding a title's render passes");
+  REX_SETTING(bool, texture_dump, false,
+              "Save every 2D texture the title loads to <texture_pack_path>/dump as DDS, named by "
+              "a hash of its data (D3D12)");
+  REX_SETTING(bool, texture_replace, true,
+              "Show <texture_pack_path>/replace/*_<hash>.dds instead of the texture with that hash, "
+              "at any resolution (D3D12)");
+  REX_SETTING(std::string, texture_overlay_set, "",
+              "Subfolder of <texture_pack_path>/overlays drawn over the textures it has images "
+              "for (such as button prompts), empty for none (D3D12)");
+  REX_SETTING(std::string, texture_pack_path, "",
+              "Texture pack folder, 'textures' next to the executable when empty");
+  REX_SETTING(bool, text_sharpen, false,
+              "Sharpen magnified bitmap text drawn by the pixel shaders in text_sharpen_shaders");
+  REX_SETTING(std::string, text_sharpen_shaders, "",
+              "Comma-separated pixel shader ucode hashes (hex) that draw bitmap text. Set by the "
+              "title; find them with log_resolve_draws");
+  REX_SETTING(bool, log_resolve_draws, false,
+              "With log_resolves, also list each draw: shader hashes, textures, depth and blend");
+  REX_SETTING(i32, log_frame_every, 0,
+              "With log_resolves, also log every Nth frame even when its passes did not change");
+  REX_SETTING(bool, log_draw_constants, false,
+              "With log_resolve_draws, add the float constants each vertex shader reads");
 
  protected:
   XenosSettings() : SettingOwner("gpu.xenos") {}

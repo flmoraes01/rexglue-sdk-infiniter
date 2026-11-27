@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <memory>
 #include <utility>
 
@@ -57,8 +58,13 @@ class D3D12Presenter final : public Presenter {
   static constexpr D3D12_RESOURCE_STATES kGuestOutputInternalState =
       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
-  /** Format used internally by Windows composition. */
+  /**
+   * Format of the swap chain in SDR, and of every target the guest output and overlays paint to
+   * (the SDR intermediate in HDR).
+   */
   static constexpr DXGI_FORMAT kSwapChainFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+  /** Swap chain format in HDR, encoded by the HDR10 pass. */
+  static constexpr DXGI_FORMAT kSwapChainFormatHDR = DXGI_FORMAT_R10G10B10A2_UNORM;
 
   /** Refresh context whose callback must use the main direct queue of the provider. */
   class D3D12GuestOutputRefreshContext final : public GuestOutputRefreshContext {
@@ -111,6 +117,9 @@ class D3D12Presenter final : public Presenter {
       bool& is_8bpc_out) override;
 
   PaintResult DriverPaintAndPresent(bool execute_ui_drawers) override;
+  /** Configures FSR frame generation and records its prepare pass for the frame being painted. */
+  void PrepareFrameGeneration(ID3D12GraphicsCommandList* command_list);
+  u32 GetDisplayRefreshHz() const;
 
  private:
   struct GuestOutputPaintRectangleConstants {
@@ -163,14 +172,16 @@ class D3D12Presenter final : public Presenter {
 
     enum RTVIndex : u8 {
       kRTVIndexSwapChainBuffer0,
+      kRTVIndexSDRIntermediate = kRTVIndexSwapChainBuffer0 + kSwapChainBufferCount,
 
-      kRTVCount = kRTVIndexSwapChainBuffer0 + kSwapChainBufferCount,
+      kRTVCount,
     };
 
     enum ViewIndex : u8 {
       kViewIndexGuestOutput0SRV,
+      kViewIndexSDRIntermediateSRV = kViewIndexGuestOutput0SRV + kGuestOutputMailboxSize,
 
-      kViewCount = kViewIndexGuestOutput0SRV + kGuestOutputMailboxSize,
+      kViewCount,
     };
 
     void AwaitSwapChainUsageCompletion() {
@@ -206,10 +217,48 @@ class D3D12Presenter final : public Presenter {
     u32 swap_chain_height = 0;
     bool swap_chain_allows_tearing = false;
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain;
+    /** FidelityFX frame generation swap chain context (ffxContext) when the swap chain is AMD's. */
+    void* frame_generation_swap_chain = nullptr;
+    /** FidelityFX frame generation context, created once the scene pass publishes a frame. */
+    void* frame_generation = nullptr;
+    u32 frame_generation_display_width = 0;
+    u32 frame_generation_display_height = 0;
+    u32 frame_generation_max_render_width = 0;
+    u32 frame_generation_max_render_height = 0;
+    u64 frame_generation_frame_id = 0;
+    bool frame_generation_was_fresh = false;
+    std::chrono::steady_clock::time_point pacing_window_start{};
+    u32 pacing_presents = 0;
+    f64 pacing_present_ms = 0.0;
+    u32 pacing_interval = 0;
+    u32 pacing_flags = 0;
+    void DestroyFrameGeneration();
+    /** True when the swap chain is Streamline's (DLSS frame generation). */
+    bool frame_generation_streamline = false;
+    u32 frame_generation_streamline_frames = 0;
+    bool frame_generation_streamline_unlimited = false;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSwapChainBufferCount> swap_chain_buffers;
+
+    /** True when the swap chain is kSwapChainFormatHDR and paints through the intermediate. */
+    bool swap_chain_hdr = false;
+    /** True when the display is in HDR mode, so the HDR10 pass encodes PQ. */
+    bool display_hdr = false;
+    /** The display's reported peak luminance in nits, 0 when unknown. */
+    f32 display_max_nits = 0.0f;
+    /**
+     * kSwapChainFormat target the frame paints to before the HDR10 pass, in COMMON state between
+     * paints. Swap chain sized.
+     */
+    Microsoft::WRL::ComPtr<ID3D12Resource> sdr_intermediate;
   };
 
   bool InitializeSurfaceIndependent();
+  /** Encodes the SDR intermediate into the swap chain buffer and leaves it ready to present. */
+  void PaintHDR10(ID3D12GraphicsCommandList* command_list, ID3D12Resource* sdr_intermediate,
+                  ID3D12Resource* swap_chain_buffer,
+                  D3D12_CPU_DESCRIPTOR_HANDLE swap_chain_buffer_rtv);
+  /** Creates sdr_intermediate and its views at the swap chain size. */
+  bool EnsureSDRIntermediate();
 
   const D3D12Provider& provider_;
 
@@ -222,6 +271,8 @@ class D3D12Presenter final : public Presenter {
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>,
              static_cast<size_t>(GuestOutputPaintEffect::kCount)>
       guest_output_paint_pipelines_;
+  /** Writes the SDR intermediate to an HDR swap chain buffer. */
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> hdr10_pipeline_;
 
   /**
    * Pairs of the refresher fence value of the last refresh and the nullable guest output texture.

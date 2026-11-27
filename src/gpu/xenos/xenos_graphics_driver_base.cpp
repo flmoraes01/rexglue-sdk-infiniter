@@ -168,6 +168,14 @@ Result<void> XenosGraphicsDriverBase::AttachTitle(const TitleInfo& info, IPhysic
       const bool fixed_vblank =
           IsVSyncEnabled() || !vblank_follows_vsync.Get();
       u64 interval_ticks = fixed_vblank ? vsync_interval_ticks : no_vsync_interval_ticks;
+      // Frame generation paces the title to what it can show (see Presenter).
+      if (const ::rex::gpu::Presenter* presenter = GetHostPresenter()) {
+        if (const f32 cap = presenter->GetTitleFrameRateCap(); cap > 0.0f) {
+          interval_ticks = std::max(
+              interval_ticks,
+              static_cast<u64>(static_cast<f64>(guest_tick_frequency) / static_cast<f64>(cap)));
+        }
+      }
       DeliverVblanks(
           Clock::QueryGuestTickCount(), last_frame_time, interval_ticks, kMaxVblankCatchUp,
           [this] { MarkVblank(); }, [this] { return vsync_worker_running_.load(); });

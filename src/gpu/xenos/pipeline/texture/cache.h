@@ -413,6 +413,11 @@ class REX_GPU_XENOS_API TextureCache : public rex::NonCopyable {
    * @return Texture, or null if the key is unsupported or creation failed.
    */
   Texture* FindOrCreateTexture(TextureKey key);
+  /** The texture with a key, or null when none exists. */
+  Texture* FindTexture(const TextureKey& key) const {
+    auto it = textures_.find(key);
+    return it != textures_.end() ? it->second.get() : nullptr;
+  }
 
   static const LoadShaderInfo& GetLoadShaderInfo(LoadShaderIndex load_shader_index) {
     REX_ASSERT(load_shader_index < kLoadShaderCount);

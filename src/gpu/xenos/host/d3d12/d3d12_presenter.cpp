@@ -10,10 +10,13 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <memory>
 #include <utility>
+
+#include <dxgi1_6.h>
 
 #include <rex/assert.h>
 #include <rex/logging/log_category.h>
@@ -23,6 +26,19 @@
 #include <rex/gpu/output_painter.h>
 #include "gpu/xenos/host/d3d12/d3d12_provider.h"
 #include "gpu/xenos/host/d3d12/d3d12_objects.h"
+#include "gpu/xenos/host/d3d12/ffx_runtime.h"
+#include "gpu/xenos/host/d3d12/streamline_runtime.h"
+
+#if REX_FFX
+// The FidelityFX headers use MSVC warning pragmas.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunknown-pragmas"
+#include <ffx_api.h>
+#include <dx12/ffx_api_dx12.h>
+#include <dx12/ffx_api_framegeneration_dx12.h>
+#include <ffx_framegeneration.h>
+#pragma clang diagnostic pop
+#endif
 #include <rex/utility.h>
 #include <rex/settings_registry.h>
 
@@ -33,6 +49,7 @@ namespace rex::gpu::d3d12 {
 namespace shaders {
 #include "gpu/xenos/host/shaders/bytecode/d3d12_5_1/guest_output_bilinear_dither_ps.h"
 #include "gpu/xenos/host/shaders/bytecode/d3d12_5_1/guest_output_bilinear_ps.h"
+#include "gpu/xenos/host/shaders/bytecode/d3d12_5_1/guest_output_hdr10_ps.h"
 #include "gpu/xenos/host/shaders/bytecode/d3d12_5_1/guest_output_triangle_strip_rect_vs.h"
 }  // namespace shaders
 
@@ -102,7 +119,8 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(gpu::Surface& ne
     DXGI_SWAP_CHAIN_DESC1 swap_chain_desc;
     swap_chain_desc.Width = static_cast<UINT>(new_swap_chain_width);
     swap_chain_desc.Height = static_cast<UINT>(new_swap_chain_height);
-    swap_chain_desc.Format = kSwapChainFormat;
+    const bool swap_chain_hdr = provider_.GetSettings().hdr.Get() && hdr10_pipeline_;
+    swap_chain_desc.Format = swap_chain_hdr ? kSwapChainFormatHDR : kSwapChainFormat;
     swap_chain_desc.Stereo = FALSE;
     swap_chain_desc.SampleDesc.Count = 1;
     swap_chain_desc.SampleDesc.Quality = 0;
@@ -127,7 +145,49 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(gpu::Surface& ne
       case gpu::Surface::kTypeIndexWin32HWND: {
         HWND surface_hwnd =
             static_cast<HWND>(static_cast<const gpu::NativeSurface&>(new_surface).GetHWND());
-        if (FAILED(dxgi_factory->CreateSwapChainForHwnd(
+        // DLSS frame generation presents through Streamline's swap chain.
+        if (StreamlineRuntime* streamline = StreamlineRuntime::Get();
+            streamline && streamline->IsFrameGenerationAvailable()) {
+          if (IDXGIFactory2* proxy = streamline->UpgradeFactory(dxgi_factory)) {
+            if (SUCCEEDED(proxy->CreateSwapChainForHwnd(direct_queue, surface_hwnd,
+                                                        &swap_chain_desc, nullptr, nullptr,
+                                                        &swap_chain_1))) {
+              paint_context_.frame_generation_streamline = true;
+              REXUI_INFO("D3D12Presenter: presenting through the Streamline (DLSS frame "
+                         "generation) swap chain");
+            }
+            proxy->Release();
+          }
+        }
+#if REX_FFX
+        // Frame generation presents through AMD's swap chain, which inserts the generated frames.
+        if (!swap_chain_1 && provider_.GetSettings().frame_generation_swap_chain.Get()) {
+          if (const FfxRuntime* ffx = GetFfxRuntime()) {
+            IDXGISwapChain4* ffx_swap_chain = nullptr;
+            ffxCreateContextDescFrameGenerationSwapChainForHwndDX12 ffx_desc = {};
+            ffx_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12;
+            ffx_desc.swapchain = &ffx_swap_chain;
+            ffx_desc.hwnd = surface_hwnd;
+            ffx_desc.desc = &swap_chain_desc;
+            ffx_desc.fullscreenDesc = nullptr;
+            ffx_desc.dxgiFactory = dxgi_factory;
+            ffx_desc.gameQueue = direct_queue;
+            void* ffx_context = nullptr;
+            const int32_t result = ffx->create(&ffx_context, &ffx_desc.header, nullptr);
+            if (result == FFX_API_RETURN_OK && ffx_swap_chain) {
+              swap_chain_1.Attach(ffx_swap_chain);
+              paint_context_.frame_generation_swap_chain = ffx_context;
+              REXUI_INFO("D3D12Presenter: presenting through the FSR frame generation swap chain");
+            } else {
+              REXUI_WARN("D3D12Presenter: the FSR frame generation swap chain failed ({}), "
+                         "presenting normally",
+                         result);
+            }
+          }
+        }
+#endif
+        if (!swap_chain_1 &&
+            FAILED(dxgi_factory->CreateSwapChainForHwnd(
                 direct_queue, surface_hwnd, &swap_chain_desc, nullptr, nullptr, &swap_chain_1))) {
           REXUI_FAIL(SurfacePaintConnectResult::kFailure,
                      "D3D12Presenter: Failed to create a swap chain for the HWND");
@@ -148,6 +208,31 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(gpu::Surface& ne
                  "interface");
     }
     // Any failure from here on must call DestroySwapChain before returning.
+    paint_context_.swap_chain_hdr = swap_chain_hdr;
+    paint_context_.display_hdr = false;
+    if (swap_chain_hdr) {
+      // Encode PQ only when the display is in HDR mode; otherwise the HDR10 pass passes the SDR
+      // frame through and the swap chain stays in the default sRGB color space.
+      Microsoft::WRL::ComPtr<IDXGIOutput> output;
+      Microsoft::WRL::ComPtr<IDXGIOutput6> output_6;
+      DXGI_OUTPUT_DESC1 output_desc;
+      UINT color_space_support = 0;
+      constexpr DXGI_COLOR_SPACE_TYPE kHDR10 = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+      if (SUCCEEDED(paint_context_.swap_chain->GetContainingOutput(&output)) &&
+          SUCCEEDED(output.As(&output_6)) && SUCCEEDED(output_6->GetDesc1(&output_desc)) &&
+          output_desc.ColorSpace == kHDR10 &&
+          SUCCEEDED(paint_context_.swap_chain->CheckColorSpaceSupport(kHDR10,
+                                                                      &color_space_support)) &&
+          (color_space_support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) &&
+          SUCCEEDED(paint_context_.swap_chain->SetColorSpace1(kHDR10))) {
+        paint_context_.display_hdr = true;
+        paint_context_.display_max_nits = output_desc.MaxLuminance;
+        REXUI_INFO("D3D12Presenter: HDR10 output (display max {:.0f} nits, full frame {:.0f})",
+                   output_desc.MaxLuminance, output_desc.MaxFullFrameLuminance);
+      } else {
+        REXUI_INFO("D3D12Presenter: HDR requested but the display is not in HDR mode, SDR output");
+      }
+    }
     paint_context_.swap_chain_width = new_swap_chain_width;
     paint_context_.swap_chain_height = new_swap_chain_height;
     paint_context_.swap_chain_allows_tearing =
@@ -173,7 +258,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(gpu::Surface& ne
   rtv_desc.Texture2D.PlaneSlice = 0;
   for (u32 i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
     ID3D12Resource* swap_chain_buffer = paint_context_.swap_chain_buffers[i].Get();
-    rtv_desc.Format = kSwapChainFormat;
+    rtv_desc.Format = paint_context_.swap_chain_hdr ? kSwapChainFormatHDR : kSwapChainFormat;
     device->CreateRenderTargetView(
         swap_chain_buffer, &rtv_desc,
         provider_.OffsetRTVDescriptor(rtv_heap_start, PaintContext::kRTVIndexSwapChainBuffer0 + i));
@@ -237,18 +322,372 @@ bool D3D12Presenter::DriverRefreshGuestOutput(
   return refresher_succeeded;
 }
 
+void D3D12Presenter::PaintContext::DestroyFrameGeneration() {
+  if (frame_generation) {
+    if (const FfxRuntime* ffx = GetFfxRuntime()) {
+      ffx->destroy(&frame_generation, nullptr);
+    }
+    frame_generation = nullptr;
+  }
+  frame_generation_display_width = frame_generation_display_height = 0;
+  frame_generation_max_render_width = frame_generation_max_render_height = 0;
+  frame_generation_was_fresh = false;
+}
+
 void D3D12Presenter::PaintContext::DestroySwapChain() {
   if (!swap_chain) {
     return;
   }
   AwaitSwapChainUsageCompletion();
+  // The frame generation context uses the swap chain, so it goes first.
+  DestroyFrameGeneration();
   for (Microsoft::WRL::ComPtr<ID3D12Resource>& swap_chain_buffer_ref : swap_chain_buffers) {
     swap_chain_buffer_ref.Reset();
   }
   swap_chain.Reset();
+  frame_generation_streamline = false;
+  frame_generation_streamline_frames = 0;
+  if (frame_generation_swap_chain) {
+    // The FidelityFX context owns the real swap chain; it goes after the last reference.
+    if (const FfxRuntime* ffx = GetFfxRuntime()) {
+      ffx->destroy(&frame_generation_swap_chain, nullptr);
+    }
+    frame_generation_swap_chain = nullptr;
+  }
+  sdr_intermediate.Reset();
+  swap_chain_hdr = false;
+  display_hdr = false;
+  display_max_nits = 0.0f;
   swap_chain_allows_tearing = false;
   swap_chain_height = 0;
   swap_chain_width = 0;
+}
+
+u32 D3D12Presenter::GetDisplayRefreshHz() const {
+  HWND window = nullptr;
+  Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain_1;
+  if (!paint_context_.swap_chain || FAILED(paint_context_.swap_chain.As(&swap_chain_1)) ||
+      FAILED(swap_chain_1->GetHwnd(&window))) {
+    return 60;
+  }
+  MONITORINFOEXW monitor = {};
+  monitor.cbSize = sizeof(monitor);
+  DEVMODEW mode = {};
+  mode.dmSize = sizeof(mode);
+  HMONITOR handle = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+  return handle && GetMonitorInfoW(handle, &monitor) &&
+                 EnumDisplaySettingsW(monitor.szDevice, ENUM_CURRENT_SETTINGS, &mode)
+             ? mode.dmDisplayFrequency
+             : 60;
+}
+
+void D3D12Presenter::PrepareFrameGeneration(ID3D12GraphicsCommandList* command_list) {
+  if (paint_context_.frame_generation_streamline) {
+    StreamlineRuntime* streamline = StreamlineRuntime::Get();
+    if (!streamline) {
+      return;
+    }
+    const std::string& mode = provider_.GetSettings().frame_generation.Get();
+    const u32 frames = mode == "dlss" ? 1 : mode == "dlss_x3" ? 2 : mode == "dlss_x4" ? 3 : 0;
+    const FrameGenerationFrame frame = provider_.GetFrameGenerationExchange().Latest();
+    const bool fresh = frames > 0 && frame.serial != 0 && frame.depth && frame.motion &&
+                       std::chrono::steady_clock::now() - frame.published <
+                           std::chrono::milliseconds(250);
+    streamline->BeginPresent(command_list, fresh ? &frame : nullptr, fresh ? frames : 0,
+                             paint_context_.swap_chain_width, paint_context_.swap_chain_height);
+    const u32 generated = fresh ? std::min(frames, streamline->GetMaxFramesToGenerate()) : 0;
+    // With the frame rate set to unlimited (no V-Sync), Reflex paces DLSS-G and the title runs
+    // free, so output can exceed the display's refresh; otherwise each rendered frame is shown
+    // with `generated` generated ones and the title renders no faster than that.
+    const bool unlimited = !GetPaintConnectionVsync();
+    if (generated != paint_context_.frame_generation_streamline_frames ||
+        unlimited != paint_context_.frame_generation_streamline_unlimited) {
+      paint_context_.frame_generation_streamline_unlimited = unlimited;
+      const f32 cap = generated && !unlimited
+                          ? std::max(30.0f, static_cast<f32>(GetDisplayRefreshHz()) /
+                                                static_cast<f32>(generated + 1))
+                          : 0.0f;
+      SetTitleFrameRateCap(cap);
+      if (cap > 0.0f) {
+        REXUI_INFO("D3D12Presenter: DLSS frame generation {}x paces the game at {:.0f} fps",
+                   generated + 1, cap);
+      }
+      paint_context_.frame_generation_streamline_frames = generated;
+    }
+    paint_context_.frame_generation_was_fresh = fresh;
+    return;
+  }
+#if REX_FFX
+  PaintContext& context = paint_context_;
+  if (!context.frame_generation_swap_chain) {
+    return;
+  }
+  const FfxRuntime* ffx = GetFfxRuntime();
+  if (!ffx) {
+    return;
+  }
+  const FrameGenerationFrame frame = provider_.GetFrameGenerationExchange().Latest();
+  // Generation runs only while the scene pass keeps publishing (gameplay); menus and screens
+  // without a 3D scene are presented as they are.
+  const bool fresh = provider_.GetSettings().frame_generation.Get() == "fsr" &&
+                     frame.serial != 0 && frame.depth && frame.motion &&
+                     std::chrono::steady_clock::now() - frame.published <
+                         std::chrono::milliseconds(250);
+  const u32 display_width = context.swap_chain_width;
+  const u32 display_height = context.swap_chain_height;
+  if (fresh &&
+      (!context.frame_generation || context.frame_generation_display_width != display_width ||
+       context.frame_generation_display_height != display_height ||
+       frame.render_width > context.frame_generation_max_render_width ||
+       frame.render_height > context.frame_generation_max_render_height)) {
+    if (context.frame_generation) {
+      context.AwaitSwapChainUsageCompletion();
+      context.DestroyFrameGeneration();
+    }
+    ffxCreateBackendDX12Desc backend = {};
+    backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
+    backend.device = provider_.GetDevice();
+    ffxCreateContextDescFrameGeneration create = {};
+    create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+    create.header.pNext = &backend.header;
+    create.flags = context.display_hdr ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE : 0;
+    create.displaySize = {display_width, display_height};
+    create.maxRenderSize = {std::max(frame.render_width, display_width),
+                            std::max(frame.render_height, display_height)};
+    create.backBufferFormat = ffxApiGetSurfaceFormatDX12(
+        context.swap_chain_hdr ? kSwapChainFormatHDR : kSwapChainFormat);
+    void* created = nullptr;
+    const int32_t result = ffx->create(&created, &create.header, nullptr);
+    if (result != FFX_API_RETURN_OK || !created) {
+      REXUI_WARN("D3D12Presenter: cannot create FSR frame generation ({})", result);
+      return;
+    }
+    context.frame_generation = created;
+    context.frame_generation_display_width = display_width;
+    context.frame_generation_display_height = display_height;
+    context.frame_generation_max_render_width = create.maxRenderSize.width;
+    context.frame_generation_max_render_height = create.maxRenderSize.height;
+    REXUI_INFO("D3D12Presenter: FSR frame generation on, {}x{} display, scene {}x{}",
+               display_width, display_height, frame.render_width, frame.render_height);
+  }
+  if (!context.frame_generation) {
+    return;
+  }
+
+  ffxConfigureDescFrameGeneration configure = {};
+  configure.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+  configure.swapChain = context.swap_chain.Get();
+  configure.presentCallback = nullptr;
+  configure.frameGenerationCallback = [](ffxDispatchDescFrameGeneration* params,
+                                         void* user) -> ffxReturnCode_t {
+    auto& paint = *static_cast<PaintContext*>(user);
+    if (paint.display_hdr) {
+      params->backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_PQ;
+      params->minMaxLuminance[0] = 0.001f;
+      params->minMaxLuminance[1] = paint.display_max_nits > 0.0f ? paint.display_max_nits : 1000.0f;
+    }
+    return GetFfxRuntime()->dispatch(&paint.frame_generation, &params->header);
+  };
+  configure.frameGenerationCallbackUserContext = &context;
+  configure.frameGenerationEnabled = fresh;
+  configure.allowAsyncWorkloads = false;
+  configure.flags = 0;
+  configure.onlyPresentGenerated = false;
+  configure.generationRect = {0, 0, static_cast<int32_t>(display_width),
+                              static_cast<int32_t>(display_height)};
+  configure.frameID = context.frame_generation_frame_id;
+  ffx->configure(&context.frame_generation, &configure.header);
+
+  if (fresh) {
+    ffxDispatchDescFrameGenerationPrepareV2 prepare = {};
+    prepare.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
+    prepare.frameID = context.frame_generation_frame_id;
+    prepare.flags = 0;
+    prepare.commandList = command_list;
+    prepare.renderSize = {frame.render_width, frame.render_height};
+    prepare.jitterOffset = {frame.jitter_x, frame.jitter_y};
+    prepare.motionVectorScale = {1.0f, 1.0f};
+    prepare.frameTimeDelta = frame.frame_time_ms;
+    prepare.reset = frame.reset || !context.frame_generation_was_fresh;
+    prepare.cameraNear = frame.camera_near;
+    prepare.cameraFar = frame.camera_far;
+    prepare.cameraFovAngleVertical = frame.camera_fov_y;
+    prepare.viewSpaceToMetersFactor = 1.0f;
+    prepare.depth =
+        ffxApiGetResourceDX12(frame.depth.Get(), FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    prepare.motionVectors =
+        ffxApiGetResourceDX12(frame.motion.Get(), FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    for (u32 i = 0; i < 3; ++i) {
+      prepare.cameraPosition[i] = frame.camera_position[i];
+      prepare.cameraUp[i] = frame.camera_up[i];
+      prepare.cameraRight[i] = frame.camera_right[i];
+      prepare.cameraForward[i] = frame.camera_forward[i];
+    }
+    const int32_t result = ffx->dispatch(&context.frame_generation, &prepare.header);
+    if (result != FFX_API_RETURN_OK) {
+      REXUI_WARN("D3D12Presenter: FSR frame generation prepare failed ({})", result);
+    }
+  }
+  if (fresh != context.frame_generation_was_fresh) {
+    f32 cap = 0.0f;
+    if (fresh) {
+      // Half the display's refresh: each rendered frame is shown with one generated frame.
+      DEVMODEW mode = {};
+      mode.dmSize = sizeof(mode);
+      MONITORINFOEXW monitor = {};
+      monitor.cbSize = sizeof(monitor);
+      HMONITOR handle = nullptr;
+      HWND window = nullptr;
+      Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain_1;
+      if (SUCCEEDED(context.swap_chain.As(&swap_chain_1)) &&
+          SUCCEEDED(swap_chain_1->GetHwnd(&window))) {
+        handle = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+      }
+      const u32 refresh =
+          handle && GetMonitorInfoW(handle, &monitor) &&
+                  EnumDisplaySettingsW(monitor.szDevice, ENUM_CURRENT_SETTINGS, &mode)
+              ? mode.dmDisplayFrequency
+              : 60;
+      cap = std::max(30.0f, static_cast<f32>(refresh) * 0.5f);
+      REXUI_INFO("D3D12Presenter: frame generation paces the game at {:.0f} fps ({} Hz display)",
+                 cap, refresh);
+    }
+    SetTitleFrameRateCap(cap);
+  }
+  context.frame_generation_was_fresh = fresh;
+  ++context.frame_generation_frame_id;
+#else
+  (void)command_list;
+#endif
+}
+
+void D3D12Presenter::PaintHDR10(ID3D12GraphicsCommandList* command_list,
+                                ID3D12Resource* sdr_intermediate,
+                                ID3D12Resource* swap_chain_buffer,
+                                D3D12_CPU_DESCRIPTOR_HANDLE swap_chain_buffer_rtv) {
+  D3D12_RESOURCE_BARRIER barriers[2];
+  barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barriers[0].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+  barriers[0].Transition.pResource = sdr_intermediate;
+  barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  barriers[1] = barriers[0];
+  barriers[1].Transition.pResource = swap_chain_buffer;
+  barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+  barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  command_list->ResourceBarrier(2, barriers);
+
+  D3D12_RESOURCE_DESC buffer_desc = swap_chain_buffer->GetDesc();
+  D3D12_VIEWPORT viewport;
+  viewport.TopLeftX = 0.0f;
+  viewport.TopLeftY = 0.0f;
+  viewport.Width = static_cast<f32>(buffer_desc.Width);
+  viewport.Height = static_cast<f32>(buffer_desc.Height);
+  viewport.MinDepth = 0.0f;
+  viewport.MaxDepth = 1.0f;
+  D3D12_RECT scissor;
+  scissor.left = 0;
+  scissor.top = 0;
+  scissor.right = static_cast<LONG>(buffer_desc.Width);
+  scissor.bottom = static_cast<LONG>(buffer_desc.Height);
+  command_list->OMSetRenderTargets(1, &swap_chain_buffer_rtv, TRUE, nullptr);
+  command_list->RSSetViewports(1, &viewport);
+  command_list->RSSetScissorRects(1, &scissor);
+  ID3D12DescriptorHeap* view_heap = paint_context_.view_heap.Get();
+  command_list->SetDescriptorHeaps(1, &view_heap);
+  command_list->SetPipelineState(hdr10_pipeline_.Get());
+  command_list->SetGraphicsRootSignature(
+      guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexBilinear].Get());
+  command_list->SetGraphicsRootDescriptorTable(
+      static_cast<UINT>(GuestOutputPaintRootParameter::kSource),
+      provider_.OffsetViewDescriptor(view_heap->GetGPUDescriptorHandleForHeapStart(),
+                                     PaintContext::kViewIndexSDRIntermediateSRV));
+  GuestOutputPaintRectangleConstants full_rect;
+  full_rect.x = -1.0f;
+  full_rect.y = 1.0f;
+  full_rect.width = 2.0f;
+  full_rect.height = -2.0f;
+  command_list->SetGraphicsRoot32BitConstants(
+      static_cast<UINT>(GuestOutputPaintRootParameter::kRectangle),
+      sizeof(full_rect) / sizeof(u32), &full_rect, 0);
+  const D3D12Settings& settings = provider_.GetSettings();
+  // Highlights past what the display can show would only clip, so cap the peak at its maximum.
+  f32 peak_nits = static_cast<f32>(settings.hdr_peak_nits.Get());
+  if (paint_context_.display_max_nits > 0.0f) {
+    peak_nits = std::min(peak_nits, paint_context_.display_max_nits);
+  }
+  const f32 hdr_constants[4] = {
+      static_cast<f32>(settings.hdr_paper_white_nits.Get()),
+      peak_nits,
+      static_cast<f32>(settings.hdr_expansion.Get()),
+      paint_context_.display_hdr ? 1.0f : 0.0f,
+  };
+  static_assert(sizeof(hdr_constants) == sizeof(BilinearConstants));
+  command_list->SetGraphicsRoot32BitConstants(
+      static_cast<UINT>(GuestOutputPaintRootParameter::kEffectConstants), 4, hdr_constants, 0);
+  command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+  command_list->DrawInstanced(4, 1, 0, 0);
+
+  barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+  barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+  command_list->ResourceBarrier(2, barriers);
+}
+
+bool D3D12Presenter::EnsureSDRIntermediate() {
+  if (paint_context_.sdr_intermediate) {
+    D3D12_RESOURCE_DESC desc = paint_context_.sdr_intermediate->GetDesc();
+    if (desc.Width == paint_context_.swap_chain_width &&
+        desc.Height == paint_context_.swap_chain_height) {
+      return true;
+    }
+    paint_context_.paint_submission_tracker.AwaitAllSubmissionsCompletion();
+    paint_context_.sdr_intermediate.Reset();
+  }
+  ID3D12Device* device = provider_.GetDevice();
+  D3D12_RESOURCE_DESC desc;
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Alignment = 0;
+  desc.Width = paint_context_.swap_chain_width;
+  desc.Height = paint_context_.swap_chain_height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = kSwapChainFormat;
+  desc.SampleDesc.Count = 1;
+  desc.SampleDesc.Quality = 0;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  if (FAILED(device->CreateCommittedResource(
+          &objects::kHeapPropertiesDefault, provider_.GetHeapFlagCreateNotZeroed(), &desc,
+          D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&paint_context_.sdr_intermediate)))) {
+    REXUI_ERROR("D3D12Presenter: Failed to create the {}x{} SDR intermediate", desc.Width,
+                desc.Height);
+    return false;
+  }
+  D3D12_RENDER_TARGET_VIEW_DESC rtv_desc;
+  rtv_desc.Format = kSwapChainFormat;
+  rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+  rtv_desc.Texture2D.MipSlice = 0;
+  rtv_desc.Texture2D.PlaneSlice = 0;
+  device->CreateRenderTargetView(
+      paint_context_.sdr_intermediate.Get(), &rtv_desc,
+      provider_.OffsetRTVDescriptor(paint_context_.rtv_heap->GetCPUDescriptorHandleForHeapStart(),
+                                    PaintContext::kRTVIndexSDRIntermediate));
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
+  srv_desc.Format = kSwapChainFormat;
+  srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv_desc.Texture2D.MostDetailedMip = 0;
+  srv_desc.Texture2D.MipLevels = 1;
+  srv_desc.Texture2D.PlaneSlice = 0;
+  srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+  device->CreateShaderResourceView(
+      paint_context_.sdr_intermediate.Get(), &srv_desc,
+      provider_.OffsetViewDescriptor(paint_context_.view_heap->GetCPUDescriptorHandleForHeapStart(),
+                                     PaintContext::kViewIndexSDRIntermediateSRV));
+  return true;
 }
 
 Presenter::PaintResult D3D12Presenter::DriverPaintAndPresent(bool execute_ui_drawers) {
@@ -269,9 +708,18 @@ Presenter::PaintResult D3D12Presenter::DriverPaintAndPresent(bool execute_ui_dra
   D3D12_CPU_DESCRIPTOR_HANDLE rtv_heap_start =
       paint_context_.rtv_heap->GetCPUDescriptorHandleForHeapStart();
   UINT back_buffer_index = paint_context_.swap_chain->GetCurrentBackBufferIndex();
-  D3D12_CPU_DESCRIPTOR_HANDLE back_buffer_rtv = provider_.OffsetRTVDescriptor(
+  D3D12_CPU_DESCRIPTOR_HANDLE swap_chain_buffer_rtv = provider_.OffsetRTVDescriptor(
       rtv_heap_start, PaintContext::kRTVIndexSwapChainBuffer0 + back_buffer_index);
-  ID3D12Resource* back_buffer = paint_context_.swap_chain_buffers[back_buffer_index].Get();
+  ID3D12Resource* swap_chain_buffer = paint_context_.swap_chain_buffers[back_buffer_index].Get();
+  // In HDR everything below paints the SDR intermediate (COMMON, which equals PRESENT, between
+  // paints, so the same barriers apply), and the HDR10 pass writes the swap chain buffer last.
+  const bool paint_hdr = paint_context_.swap_chain_hdr && EnsureSDRIntermediate();
+  D3D12_CPU_DESCRIPTOR_HANDLE back_buffer_rtv =
+      paint_hdr ? provider_.OffsetRTVDescriptor(rtv_heap_start,
+                                                PaintContext::kRTVIndexSDRIntermediate)
+                : swap_chain_buffer_rtv;
+  ID3D12Resource* back_buffer =
+      paint_hdr ? paint_context_.sdr_intermediate.Get() : swap_chain_buffer;
   bool back_buffer_acquired = false;
   bool back_buffer_bound = false;
   bool back_buffer_clear_needed = true;
@@ -541,15 +989,20 @@ Presenter::PaintResult D3D12Presenter::DriverPaintAndPresent(bool execute_ui_dra
     ExecuteOverlayLayersFromUIThread(ui_draw_context);
   }
 
-  D3D12_RESOURCE_BARRIER barrier_rtv_to_present;
-  barrier_rtv_to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  barrier_rtv_to_present.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-  barrier_rtv_to_present.Transition.pResource = back_buffer;
-  barrier_rtv_to_present.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  barrier_rtv_to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-  barrier_rtv_to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-  command_list->ResourceBarrier(1, &barrier_rtv_to_present);
+  if (paint_hdr) {
+    PaintHDR10(command_list, back_buffer, swap_chain_buffer, swap_chain_buffer_rtv);
+  } else {
+    D3D12_RESOURCE_BARRIER barrier_rtv_to_present;
+    barrier_rtv_to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier_rtv_to_present.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier_rtv_to_present.Transition.pResource = back_buffer;
+    barrier_rtv_to_present.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier_rtv_to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier_rtv_to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    command_list->ResourceBarrier(1, &barrier_rtv_to_present);
+  }
 
+  PrepareFrameGeneration(command_list);
   command_list->Close();
   ID3D12CommandList* execute_command_list = command_list;
   provider_.GetDirectQueue()->ExecuteCommandLists(1, &execute_command_list);
@@ -561,11 +1014,43 @@ Presenter::PaintResult D3D12Presenter::DriverPaintAndPresent(bool execute_ui_dra
       ChoosePresentSync(GetPaintConnectionVsync(), paint_context_.swap_chain_allows_tearing);
   UINT present_flags = 0;
   if (present_sync.sync_interval == 0) {
-    present_flags =
-        DXGI_PRESENT_RESTART | (present_sync.allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    // RESTART drops queued presents; AMD's swap chain queues its generated frame, so not there.
+    present_flags = (paint_context_.frame_generation_swap_chain ||
+                             paint_context_.frame_generation_streamline
+                         ? 0u
+                         : UINT(DXGI_PRESENT_RESTART)) |
+                    (present_sync.allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
   }
+  const auto present_start = std::chrono::steady_clock::now();
   HRESULT present_result =
       paint_context_.swap_chain->Present(present_sync.sync_interval, present_flags);
+  if (paint_context_.frame_generation_streamline) {
+    if (StreamlineRuntime* streamline = StreamlineRuntime::Get()) {
+      streamline->EndPresent();
+    }
+  }
+  if (paint_context_.frame_generation_swap_chain || paint_context_.frame_generation_streamline) {
+    // Pacing diagnostics while presenting through the frame generation swap chain.
+    PaintContext& pc = paint_context_;
+    const auto now = std::chrono::steady_clock::now();
+    pc.pacing_presents++;
+    pc.pacing_present_ms += std::chrono::duration<f64, std::milli>(now - present_start).count();
+    pc.pacing_interval = present_sync.sync_interval;
+    pc.pacing_flags = present_flags;
+    if (pc.pacing_window_start.time_since_epoch().count() == 0) {
+      pc.pacing_window_start = now;
+    } else if (now - pc.pacing_window_start >= std::chrono::seconds(2)) {
+      const f64 seconds = std::chrono::duration<f64>(now - pc.pacing_window_start).count();
+      REXUI_INFO("FG pacing: {:.1f} presents/s, Present blocks {:.2f} ms on average, interval {} "
+                 "flags 0x{:X}, generation {}",
+                 pc.pacing_presents / seconds, pc.pacing_present_ms / pc.pacing_presents,
+                 pc.pacing_interval, pc.pacing_flags,
+                 pc.frame_generation_was_fresh ? "on" : "off");
+      pc.pacing_presents = 0;
+      pc.pacing_present_ms = 0.0;
+      pc.pacing_window_start = now;
+    }
+  }
   // Present may enqueue work internally even when it fails.
   paint_context_.present_submission_tracker.NextSubmission();
   switch (present_result) {
@@ -708,6 +1193,19 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
                  "pipeline for effect {} writing to a swap chain buffer",
                  i);
     }
+  }
+
+  // HDR10 pass: same root signature and vertex shader as bilinear, HDR swap chain format. Without
+  // it the swap chain stays SDR.
+  guest_output_paint_pipeline_desc.PS.pShaderBytecode = shaders::kGuestOutputHdr10PS;
+  guest_output_paint_pipeline_desc.PS.BytecodeLength = sizeof(shaders::kGuestOutputHdr10PS);
+  guest_output_paint_pipeline_desc.pRootSignature =
+      guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexBilinear].Get();
+  guest_output_paint_pipeline_desc.RTVFormats[0] = kSwapChainFormatHDR;
+  if (FAILED(device->CreateGraphicsPipelineState(&guest_output_paint_pipeline_desc,
+                                                 IID_PPV_ARGS(&hdr10_pipeline_)))) {
+    REXUI_ERROR("D3D12Presenter: Failed to create the HDR10 pipeline, HDR is unavailable");
+    hdr10_pipeline_.Reset();
   }
 
   ID3D12CommandQueue* direct_queue = provider_.GetDirectQueue();

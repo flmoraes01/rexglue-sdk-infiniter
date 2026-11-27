@@ -17,6 +17,7 @@
 #include "gpu/xenos/host/d3d12/d3d12_immediate_drawer.h"
 #include "gpu/xenos/host/d3d12/d3d12_presenter.h"
 #include "gpu/xenos/host/d3d12/d3d12_provider.h"
+#include "gpu/xenos/host/d3d12/streamline_runtime.h"
 
 #include <malloc.h>
 
@@ -46,6 +47,7 @@ std::unique_ptr<D3D12Provider> D3D12Provider::Create(i32 adapter_index,
 }
 
 D3D12Provider::~D3D12Provider() {
+  StreamlineRuntime::Shutdown();
   if (graphics_analysis_ != nullptr) {
     graphics_analysis_->Release();
   }
@@ -102,6 +104,10 @@ bool D3D12Provider::EnableIncreaseBasePriorityPrivilege() {
 }
 
 bool D3D12Provider::Initialize(i32 adapter_index_wanted) {
+  // DLSS frame generation goes through Streamline, which must be set up before the device.
+  if (settings_->frame_generation.Get().starts_with("dlss")) {
+    StreamlineRuntime::Initialize();
+  }
   library_dxgi_ = LoadLibraryW(L"dxgi.dll");
   library_d3d12_ = LoadLibraryW(L"D3D12.dll");
   if (!library_dxgi_ || !library_d3d12_) {
@@ -310,6 +316,20 @@ bool D3D12Provider::Initialize(i32 adapter_index_wanted) {
     if (settings_->break_on_warning.Get()) {
       d3d12_info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, TRUE);
     }
+    // Debug layer errors otherwise only reach an attached debugger; copy them to the log so a
+    // device removal in a player's run can be traced to the call that caused it.
+    Microsoft::WRL::ComPtr<ID3D12InfoQueue1> d3d12_info_queue1;
+    if (SUCCEEDED(d3d12_info_queue->QueryInterface(IID_PPV_ARGS(&d3d12_info_queue1)))) {
+      DWORD callback_cookie = 0;
+      d3d12_info_queue1->RegisterMessageCallback(
+          [](D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id,
+             LPCSTR description, void*) {
+            if (severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
+              REXGPU_ERROR("D3D12 debug layer (id {}): {}", static_cast<int>(id), description);
+            }
+          },
+          D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &callback_cookie);
+    }
     d3d12_info_queue->Release();
   }
 
@@ -354,6 +374,9 @@ bool D3D12Provider::Initialize(i32 adapter_index_wanted) {
   dxgi_factory_ = dxgi_factory;
   device_ = device;
   direct_queue_ = direct_queue;
+  if (StreamlineRuntime* streamline = StreamlineRuntime::Get()) {
+    streamline->SetDevice(device);
+  }
 
   for (u32 i = 0; i < D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES; ++i) {
     descriptor_sizes_[i] =

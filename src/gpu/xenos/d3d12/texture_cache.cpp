@@ -11,11 +11,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cfloat>
 #include <cstddef>
 #include <cstring>
 #include <memory>
 #include <utility>
+
+#include <xxhash.h>
 
 #include <rex/assert.h>
 #include <rex/platform/perf.h>
@@ -634,6 +637,7 @@ void D3D12TextureCache::BeginSubmission(u64 new_submission_index) {
 
 void D3D12TextureCache::BeginFrame() {
   TextureCache::BeginFrame();
+  UpdateTextureOverlays();
 
   std::memset(unsupported_format_features_used_, 0, sizeof(unsupported_format_features_used_));
 }
@@ -731,8 +735,13 @@ bool D3D12TextureCache::IsActiveTextureSRVKeysUpToDate(
       }
       continue;
     }
+    const u32 replacement_generation =
+        binding->texture
+            ? static_cast<const D3D12Texture*>(binding->texture)->GetReplacementGeneration()
+            : 0;
     if (key.key != binding->key || key.host_swizzle != binding->host_swizzle ||
-        key.swizzled_signs != binding->swizzled_signs) {
+        key.swizzled_signs != binding->swizzled_signs ||
+        key.replacement_generation != replacement_generation) {
       return false;
     }
   }
@@ -754,6 +763,10 @@ void D3D12TextureCache::WriteActiveTextureSRVKeys(
     key.key = binding->key;
     key.host_swizzle = binding->host_swizzle;
     key.swizzled_signs = binding->swizzled_signs;
+    key.replacement_generation =
+        binding->texture ? static_cast<const D3D12Texture*>(binding->texture)
+                               ->GetReplacementGeneration()
+                         : 0;
   }
 }
 
@@ -1788,6 +1801,41 @@ bool D3D12TextureCache::LoadHostTextureDataFromResidentMemory(Texture& texture, 
     } else {
       source_box_ptr = nullptr;
     }
+    // A copy that extends past the destination removes the device, so clamp it to the
+    // destination level and log the texture once to find out how the sizes disagreed.
+    {
+      D3D12_RESOURCE_DESC dest_desc = texture_resource->GetDesc();
+      u32 dest_width = rex::RoundUpNonZero(
+          std::max(static_cast<u32>(dest_desc.Width >> level), u32(1)), host_block_width);
+      u32 dest_height = rex::RoundUpNonZero(
+          std::max(static_cast<u32>(dest_desc.Height >> level), u32(1)), host_block_height);
+      if (!source_box_ptr) {
+        source_box.left = 0;
+        source_box.top = 0;
+        source_box.front = 0;
+        source_box.right = location_source.PlacedFootprint.Footprint.Width;
+        source_box.bottom = location_source.PlacedFootprint.Footprint.Height;
+        source_box.back = location_source.PlacedFootprint.Footprint.Depth;
+      }
+      u32 box_width = source_box.right - source_box.left;
+      u32 box_height = source_box.bottom - source_box.top;
+      if (box_width > dest_width || box_height > dest_height) {
+        static std::atomic<u32> logged_count{0};
+        if (logged_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+          REXGPU_WARN(
+              "D3D12TextureCache: clamped a {}x{} copy to a {}x{} level {} of a {}x{} texture "
+              "(guest {}x{}x{}, format {}, mips {}, packed level {}, scaled {}, "
+              "loaded base {} mips {})",
+              box_width, box_height, dest_width, dest_height, level, dest_desc.Width,
+              dest_desc.Height, width, height, depth_or_array_size,
+              static_cast<u32>(guest_format), texture_level_count, level_packed,
+              texture_resolution_scaled, load_base, load_mips);
+        }
+        source_box.right = source_box.left + std::min(box_width, dest_width);
+        source_box.bottom = source_box.top + std::min(box_height, dest_height);
+        source_box_ptr = &source_box;
+      }
+    }
     for (u32 layer = 0; layer < array_size; ++layer) {
       command_list.D3DCopyTextureRegion(&location_dest, 0, 0, 0, &location_source, source_box_ptr);
       location_dest.SubresourceIndex += texture_level_count;
@@ -1816,7 +1864,85 @@ bool D3D12TextureCache::LoadHostTextureDataFromResidentMemory(Texture& texture, 
     });
     command_processor_.InvalidateCommandListBindings();
   }
+  if (load_base) {
+    UpdateTextureReplacement(d3d12_texture);
+  }
   return true;
+}
+
+void D3D12TextureCache::UpdateTextureReplacement(Texture& base_texture) {
+  auto& texture = static_cast<D3D12Texture&>(base_texture);
+  const XenosSettings& settings = command_processor_.GetXenosSettings();
+  texture_replacement_.Configure(settings.texture_dump.Get(), settings.texture_replace.Get(),
+                                 settings.texture_pack_path.Get(),
+                                 settings.texture_overlay_set.Get());
+  texture_replacement_.Poll();
+  const TextureKey key = texture.GetKey();
+  // Plain 2D textures only: render-to-texture copies and arrays change every frame or need more.
+  if (key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1 ||
+      key.scaled_resolve || key.GetWidth() < 8 || key.GetHeight() < 8 ||
+      (!texture_replacement_.IsDumping() && !texture_replacement_.IsReplacing() &&
+       !texture_replacement_.IsOverlaying())) {
+    texture.SetReplacement(nullptr);
+    return;
+  }
+  const u32 size = texture.GetGuestLayout().base.level_data_extent_bytes;
+  auto span = command_processor_.GetGuestPhysicalMemory().GetReadOnlyPhysicalSpan(
+      PhysicalRange{static_cast<u32>(key.base_page) << 12, size});
+  if (!span || span->size() < size) {
+    texture.SetReplacement(nullptr);
+    return;
+  }
+  // The format and size join the data, so the same bytes read as another texture do not match.
+  u64 hash = XXH3_64bits(span->data(), span->size());
+  const u64 shape[] = {key.GetWidth(), key.GetHeight(), static_cast<u64>(key.format)};
+  hash = XXH3_64bits_withSeed(shape, sizeof(shape), hash);
+  if (texture.NoteContentHash(hash)) {
+    texture.SetReplacement(nullptr);
+    return;
+  }
+  // Right after a load the texture is a copy destination, as the tracked state stays.
+  const D3D12_RESOURCE_STATES state = texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST);
+  texture_replacement_.Dump(hash, texture.GetResource(), state, key.GetWidth(), key.GetHeight());
+  if (texture_replacement_.HasAnyOverlay(hash)) {
+    overlay_textures_.insert(key);
+  }
+  texture.SetReplacement(ChooseReplacement(texture, hash, state));
+}
+
+const TextureReplacement::Replacement* D3D12TextureCache::ChooseReplacement(
+    Texture& texture, u64 hash, D3D12_RESOURCE_STATES state) {
+  if (const TextureReplacement::Replacement* composite = texture_replacement_.FindComposite(
+          hash, static_cast<D3D12Texture&>(texture).GetResource(), state)) {
+    return composite;
+  }
+  return texture_replacement_.Find(hash);
+}
+
+void D3D12TextureCache::UpdateTextureOverlays() {
+  const XenosSettings& settings = command_processor_.GetXenosSettings();
+  texture_replacement_.Configure(settings.texture_dump.Get(), settings.texture_replace.Get(),
+                                 settings.texture_pack_path.Get(),
+                                 settings.texture_overlay_set.Get());
+  texture_replacement_.Poll();
+  const u32 generation = texture_replacement_.GetOverlayGeneration();
+  if (generation == overlay_generation_seen_) {
+    return;
+  }
+  overlay_generation_seen_ = generation;
+  for (auto it = overlay_textures_.begin(); it != overlay_textures_.end();) {
+    auto* texture = static_cast<D3D12Texture*>(FindTexture(*it));
+    const u64 hash = texture ? texture->GetContentHash() : 0;
+    if (!texture || !texture_replacement_.HasAnyOverlay(hash)) {
+      it = overlay_textures_.erase(it);
+      continue;
+    }
+    // The read-back transitions from this state and back; the tracked state does not change.
+    const D3D12_RESOURCE_STATES state = texture->SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST);
+    texture->SetResourceState(state);
+    texture->SetReplacement(ChooseReplacement(*texture, hash, state));
+    ++it;
+  }
 }
 
 void D3D12TextureCache::UpdateHostTextureBindings(u32 fetch_constant_mask) {
@@ -1925,6 +2051,10 @@ u32 D3D12TextureCache::FindOrCreateTextureDescriptor(D3D12Texture& texture,
   descriptor_key.is_signed = static_cast<u32>(is_signed);
   descriptor_key.host_swizzle = host_swizzle;
   descriptor_key.dimension = static_cast<u32>(dimension);
+  const TextureReplacement::Replacement* replacement =
+      !is_signed && dimension == xenos::DataDimension::k2DOrStacked ? texture.GetReplacement()
+                                                                    : nullptr;
+  descriptor_key.replaced = replacement ? 1 : 0;
 
   u32 existing_descriptor_index = texture.GetSRVDescriptorIndex(descriptor_key);
   if (existing_descriptor_index != UINT32_MAX) {
@@ -1999,6 +2129,15 @@ u32 D3D12TextureCache::FindOrCreateTextureDescriptor(D3D12Texture& texture,
       return UINT32_MAX;
   }
 
+  if (replacement) {
+    // The pack file in place of the guest data, in the same channel layout.
+    resource_for_view = replacement->resource.Get();
+    desc.Format = replacement->format;
+    desc.Texture2DArray.MostDetailedMip = 0;
+    desc.Texture2DArray.MipLevels = replacement->mip_levels;
+    desc.Texture2DArray.FirstArraySlice = 0;
+    desc.Texture2DArray.ArraySize = 1;
+  }
   desc.Shader4ComponentMapping =
       host_swizzle | D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
 

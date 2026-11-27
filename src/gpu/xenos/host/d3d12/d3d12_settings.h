@@ -57,12 +57,91 @@ class D3D12Settings : public SettingOwner {
               kStartupOnly);
   REX_SETTING(bool, tiled_shared_memory, true, "Use tiled shared memory", kRestart);
   REX_SETTING(bool, allow_tearing, true, "Allow variable refresh rate and tearing");
+  REX_SETTING(bool, hdr, false,
+              "HDR10 output on displays in HDR mode, expanding the SDR image with an inverse "
+              "tone map",
+              kRestart);
+  REX_SETTING(f64, hdr_paper_white_nits, 200.0, "HDR brightness of SDR white (UI, midtones)",
+              Range{80.0, 500.0});
+  REX_SETTING(f64, hdr_peak_nits, 1000.0, "HDR brightest highlight", Range{200.0, 10000.0});
+  REX_SETTING(f64, hdr_expansion, 4.0,
+              "HDR highlight expansion curve, higher keeps more of the image at SDR levels",
+              Range{1.0, 16.0});
   REX_SETTING(bool, debug, false, "Enable Direct3D 12 and DXGI debug layer", kStartupOnly);
   REX_SETTING(bool, break_on_error, false, "Break on Direct3D 12 validation errors");
   REX_SETTING(bool, break_on_warning, false, "Break on Direct3D 12 validation warnings");
   REX_SETTING(i32, queue_priority, 1,
               "Graphics command queue priority, 0 for normal, 1 for high, 2 for realtime",
               Range{0, 2});
+
+  // NVIDIA DLSS. The title tells where its 3D scene ends and where its camera matrix lives.
+  REX_SETTING(std::string, dlss, "off",
+              "Scene anti-aliasing: off, smaa (any GPU), dlaa (NVIDIA, native resolution), or DLSS "
+              "super resolution "
+              "from a smaller scene: quality (67%), balanced (58%), performance (50%); needs an "
+              "RTX GPU and nvngx_dlss.dll next to the executable");
+  REX_SETTING(std::string, dlss_preset, "default",
+              "DLSS model: default, cnn (the convolutional model), or transformer preset J, K, L "
+              "or M");
+  REX_SETTING(std::string, frame_generation, "off",
+              "Frame generation: off, fsr (AMD, any GPU), or dlss / dlss_x3 / dlss_x4 (NVIDIA "
+              "DLSS frame generation 2x, 3x, 4x; RTX 40/50). Switches at run time within AMD or "
+              "NVIDIA; going from one to the other takes a restart (the swap chain is theirs)");
+  REX_SETTING(bool, frame_generation_swap_chain, true,
+              "Present through AMD's frame generation swap chain when FidelityFX is available, so "
+              "frame generation can be switched at run time", kRestart);
+  REX_SETTING(std::string, upscaler, "dlss",
+              "Upscaler for the dlaa/quality/balanced/performance modes: dlss (NVIDIA RTX) or fsr "
+              "(AMD FSR, any GPU; needs amd_fidelityfx_loader_dx12.dll and "
+              "amd_fidelityfx_upscaler_dx12.dll next to the executable)");
+  REX_SETTING(bool, ssgi, false,
+              "Screen-space global illumination on the 3D scene: ambient occlusion and one bounce "
+              "of indirect light from depth (not ray traced)");
+  REX_SETTING(f64, ssgi_strength, 1.0, "Screen-space GI indirect light strength", Range{0.0, 4.0});
+  REX_SETTING(f64, ssgi_ao_strength, 0.7, "Screen-space GI ambient occlusion strength",
+              Range{0.0, 1.0});
+  REX_SETTING(f64, ssgi_radius, 1.5, "Screen-space GI gather radius, in the game's units",
+              Range{0.1, 20.0});
+  REX_SETTING(f64, sharpening, 0.0,
+              "AMD FidelityFX CAS sharpening of the 3D scene (before the HUD): 0 off, up to 1",
+              Range{0.0, 1.0});
+  REX_SETTING(bool, dlss_nr, false,
+              "DLSS Neural Rendering (NVIDIA's generative detail model) on the 3D scene; needs "
+              "nvngx_dlssnr.dll next to the executable");
+  REX_SETTING(std::string, dlss_nr_style, "default", "Neural Rendering style: default, natural or "
+              "cinematic");
+  REX_SETTING(f64, dlss_nr_intensity, 1.0, "Neural Rendering intensity", Range{0.0, 2.0});
+  REX_SETTING(f64, dlss_nr_local_structure, 1.0, "Neural Rendering local structure strength",
+              Range{0.0, 2.0});
+  REX_SETTING(f64, dlss_nr_local_tone, 1.0, "Neural Rendering local tone strength",
+              Range{0.0, 2.0});
+  REX_SETTING(f64, dlss_nr_skin_structure, -1.0,
+              "Neural Rendering skin structure strength, -1 for the model's own", Range{-1.0, 2.0});
+  REX_SETTING(std::string, dlss_nr_placement, "after",
+              "Neural Rendering before or after DLSS: after (on DLSS's output) or before (on the "
+              "rendered scene)");
+  REX_SETTING(f64, dlss_nr_detail_strength, 1.5,
+              "How much of the model's change in light is kept: 1 as the model gives it, higher "
+              "amplifies it", Range{0.0, 4.0});
+  REX_SETTING(f64, dlss_nr_colour_strength, 1.0,
+              "How much of the model's colour is taken: 0 keeps the game's colour", Range{0.0, 1.0});
+  REX_SETTING(std::string, dlss_nr_debug, "off",
+              "Neural Rendering debug view: off, difference (what the model changed, x16) or "
+              "model (its raw answer)");
+  REX_SETTING(bool, dlss_jitter, true,
+              "Shift the scene by a sub-pixel amount each frame for DLSS (off only to debug)");
+  REX_SETTING(bool, dlss_jitter_invert, false,
+              "Report the jitter to the upscaler with the opposite sign (debugging the "
+              "convention; NVIDIA's and AMD's both take the offset applied to the camera)");
+  REX_SETTING(std::string, dlss_scene_address, "",
+              "Title: guest address (hex) of the resolve that ends the 3D scene, before "
+              "post-processing and HUD");
+  REX_SETTING(std::string, dlss_camera_shaders, "",
+              "Title: comma-separated vertex shader ucode hashes (hex) that hold the camera's "
+              "view-projection matrix");
+  REX_SETTING(i32, dlss_camera_register, 0,
+              "Title: first float constant of the view-projection matrix (4 rows, row vector)",
+              Range{0, 252});
 };
 
 }  // namespace rex::gpu::d3d12

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <deque>
 #include <memory>
@@ -96,6 +97,12 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   /** Forgets the bound command list state, after commands recorded outside the processor. */
   void InvalidateCommandListBindings();
+
+  /** Guest physical memory, for host features that read guest data (texture packs). */
+  IPhysicalMemory& GetGuestPhysicalMemory() const { return physical_memory_; }
+
+  /** Runs DLSS on the scene render target when this resolve ends the title's 3D scene. */
+  void RunDlssBeforeResolve(const draw_state::ResolveRequest& resolve_info);
 
   /**
    * Finds or creates the root signature for a pipeline.
@@ -501,6 +508,64 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unique_ptr<D3D12SharedMemory> shared_memory_;
 
   std::unique_ptr<D3D12RenderTargetCache> render_target_cache_;
+
+  // DLSS (dlss_pass.h). The scene is the draws with a full-frame viewport before the resolve to
+  // dlss_scene_address; they are jittered, and DLSS runs on their render target at that resolve.
+  struct DlssCall {
+    D3D12CommandProcessor* processor;
+    DlssPass::Inputs inputs;
+  };
+  static void DlssHostCall(void* user, ID3D12GraphicsCommandList* command_list);
+  struct DlssMode {
+    bool dlss = false;  // DLAA or Super Resolution
+    u32 quality = 5;    // NVSDK_NGX_PerfQuality_Value
+    f32 ratio = 1.0f;   // rendered size / output size
+    bool smaa = false;  // SMAA instead of DLSS
+  };
+  DlssMode GetDlssMode() const;
+  static u32 DlssRenderSize(u32 size, f32 ratio);
+  bool IsUpscalerSupported();
+  std::chrono::steady_clock::time_point dlss_last_frame_time_{};
+  f32 dlss_frame_time_ms_ = 16.7f;
+  static bool IsDlssCameraCut(const std::array<f32, 16>& reproject);
+  bool IsDlssActive();
+  bool IsDlssCameraShader(u64 ucode_hash);
+  void NoteDlssDraw(const Shader& vertex_shader);
+  void EndDlssFrame(u32 frontbuffer_width, u32 frontbuffer_height);
+  void InvalidateCommandListState();
+  DlssPass dlss_pass_;
+  bool dlss_initialize_attempted_ = false;
+  std::vector<std::unique_ptr<DlssCall>> dlss_calls_;  // live until the submission executes
+  std::string dlss_camera_shaders_text_;
+  std::vector<u64> dlss_camera_shaders_;
+  std::array<f32, 16> dlss_view_projection_{};
+  std::array<f32, 16> dlss_previous_view_projection_{};
+  bool dlss_view_projection_valid_ = false;
+  bool dlss_previous_view_projection_valid_ = false;
+  bool dlss_scene_done_ = false;
+  // Why DLSS did not run on the last frame ("" while it runs), logged when it changes.
+  std::string dlss_state_;
+  // Diagnostics: the largest viewport of a draw with a colour target this frame, and how many
+  // full-frame draws had colour and depth.
+  u32 dlss_colour_viewport_[2] = {};
+  u32 dlss_full_frame_draws_[3] = {};  // all, with colour, with depth
+  void NoteDlssState(std::string state);
+  std::chrono::steady_clock::time_point dlss_state_logged_at_{};
+  u32 dlss_state_changes_unlogged_ = 0;
+  std::string dlss_state_message_;  // the latest state in full, logged once the 2 s have passed
+  void LogDlssState();
+  // Jitter only while DLSS runs, so screens it cannot handle (MSAA) are not left shaking.
+  bool dlss_ran_this_frame_ = false;
+  bool dlss_ran_last_frame_ = false;
+  bool dlss_jitter_draw_ = false;
+  // Super Resolution: scene draws are squeezed into the top-left render_ratio of the target.
+  bool dlss_shrink_draw_ = false;
+  f32 dlss_render_ratio_ = 1.0f;  // of the current frame
+  u32 dlss_phase_count_ = 16;
+  u32 dlss_frame_index_ = 0;
+  f32 dlss_jitter_[2] = {};  // host pixels, +x right, +y down
+  u32 dlss_backbuffer_size_[2] = {};
+  void* dlss_streamline_token_ = nullptr;  // sl::FrameToken* of the title frame in progress
 
   static constexpr u32 kWindowTitleStateValid = u32{1} << 31;
   std::atomic<u32> window_title_state_{0};

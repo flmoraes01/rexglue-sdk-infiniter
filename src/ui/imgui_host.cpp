@@ -378,6 +378,9 @@ ImDrawData* ImGuiHost::BuildFrame() {
     if (!entry.dialog->Draw(ImGui::GetIO())) {
       entry.dialog->OnClose();
       RemoveDialog(*entry.dialog, entry.id);
+      if (hooks_.dialog_closed) {
+        hooks_.dialog_closed();
+      }
     }
   }
   dialog_loop_next_index_ = SIZE_MAX;

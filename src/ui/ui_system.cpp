@@ -242,6 +242,8 @@ void UISystem::State::CreateImGui() {
   hooks.set_mouse_capture = [this](bool captured) { driver->CaptureMouse(captured); };
   hooks.get_clipboard = [this] { return driver->GetClipboardText(); };
   hooks.set_clipboard = [this](std::string_view text) { driver->SetClipboardText(text); };
+  // An exclusive overlay that closes itself (B or Esc) must release the pad block it holds.
+  hooks.dialog_closed = [this] { SyncOverlayBlock(); };
   imgui = std::make_unique<ui::ImGuiHost>(std::move(hooks));
   imgui->SetDialogCounter(&dialog_count);
   imgui->SetDisplay(window_width, window_height, content_scale);

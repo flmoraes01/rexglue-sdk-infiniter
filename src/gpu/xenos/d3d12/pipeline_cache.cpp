@@ -1,4 +1,4 @@
-/**
+﻿/**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
@@ -29,6 +29,7 @@
 
 #include <format>
 
+#include <rex/gpu/shader_storage_progress.h>
 #include <rex/assert.h>
 #include <rex/chrono.h>
 #include <rex/platform/perf.h>
@@ -233,6 +234,18 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   bool edram_rov_used =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
 
+  // Progress for a "preparing shaders" display; cleared on every return below.
+  gpu::ShaderStorageProgress& progress = gpu::GetShaderStorageProgress();
+  progress.shaders_queued = 0;
+  progress.shaders_done = 0;
+  progress.pipelines_total = 0;
+  progress.pipelines_done = 0;
+  progress.active = true;
+  struct ProgressEnd {
+    gpu::ShaderStorageProgress& progress;
+    ~ProgressEnd() { progress.active = false; }
+  } progress_end{progress};
+
   std::vector<PipelineStoredDescription> pipeline_stored_descriptions;
   std::set<std::pair<u64, u64>> shader_translations_needed;
   auto pipeline_storage_file_path =
@@ -395,6 +408,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
             shaders_failed_to_translate.push_back(translation);
           }
         }
+        progress.shaders_done.fetch_add(1, std::memory_order_relaxed);
         {
           std::lock_guard<std::mutex> lock(shaders_translation_thread_mutex);
           --shader_translation_threads_busy;
@@ -455,6 +469,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       }
       shaders_translation_thread_cond.notify_one();
       ++shaders_translated;
+      progress.shaders_queued.fetch_add(1, std::memory_order_relaxed);
     }
     if (!shader_translation_threads.empty()) {
       {
@@ -597,6 +612,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       pipelines_.emplace(pipeline_stored_description.description_hash,
                          std::move(new_pipeline_owner));
       REX_PROFILE_PLOT("gpu/pipeline_cache/pipelines", pipelines_.size());
+      progress.pipelines_total.fetch_add(1, std::memory_order_relaxed);
       if (!creation_threads_.empty()) {
         {
           std::lock_guard<std::mutex> lock(creation_request_lock_);
@@ -606,6 +622,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       } else {
         new_pipeline->state.store(CreateD3D12Pipeline(pipeline_runtime_description),
                                   std::memory_order_release);
+        progress.pipelines_done.fetch_add(1, std::memory_order_relaxed);
       }
       ++pipelines_created;
     }
@@ -766,6 +783,32 @@ DXBCShaderTranslator::Modification PipelineCache::GetCurrentVertexShaderModifica
   return modification;
 }
 
+bool PipelineCache::IsTextSharpened(u64 ucode_data_hash) const {
+  const auto& settings = command_processor_.GetXenosSettings();
+  if (!settings.text_sharpen.Get()) {
+    return false;
+  }
+  const std::string text = settings.text_sharpen_shaders.Get();
+  if (text != text_sharpen_shaders_text_) {
+    text_sharpen_shaders_text_ = text;
+    text_sharpen_shaders_.clear();
+    size_t start = 0;
+    while (start < text.size()) {
+      size_t end = text.find(',', start);
+      if (end == std::string::npos) {
+        end = text.size();
+      }
+      const std::string item = text.substr(start, end - start);
+      if (u64 hash = std::strtoull(item.c_str(), nullptr, 16)) {
+        text_sharpen_shaders_.push_back(hash);
+      }
+      start = end + 1;
+    }
+  }
+  return std::find(text_sharpen_shaders_.begin(), text_sharpen_shaders_.end(), ucode_data_hash) !=
+         text_sharpen_shaders_.end();
+}
+
 DXBCShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModification(
     const Shader& shader, u32 interpolator_mask, u32 param_gen_pos,
     xenos::reg::RB_DEPTHCONTROL normalized_depth_control) const {
@@ -778,6 +821,7 @@ DXBCShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
           shader.GetDynamicAddressableRegisterCount(
               regs.Get<xenos::reg::SQ_PROGRAM_CNTL>().ps_num_reg)));
 
+  modification.pixel.sharpen_texture_edges = IsTextSharpened(shader.GetUcodeDataHash());
   modification.pixel.interpolator_mask = interpolator_mask;
   modification.pixel.interpolators_centroid =
       interpolator_mask & ~xenos::GetInterpolatorSamplingPattern(
@@ -2883,6 +2927,7 @@ void PipelineCache::CreationThread(size_t thread_index) {
       pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
                                       std::memory_order_release);
     }
+    NoteStoragePipelineCreated();
 
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
@@ -2906,10 +2951,19 @@ void PipelineCache::CreateQueuedPipelinesOnProcessorThread() {
     PipelineRuntimeDescription runtime_description;
     if (!PrepareRuntimeDescriptionForQueuedCreation(pipeline_to_create, runtime_description)) {
       pipeline_to_create->state.store(nullptr, std::memory_order_release);
-      continue;
+    } else {
+      pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
+                                      std::memory_order_release);
     }
-    pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
-                                    std::memory_order_release);
+    NoteStoragePipelineCreated();
+  }
+}
+
+void PipelineCache::NoteStoragePipelineCreated() {
+  // Counts only while the storage loads; pipelines the title asks for later are not progress.
+  gpu::ShaderStorageProgress& progress = gpu::GetShaderStorageProgress();
+  if (progress.active.load(std::memory_order_relaxed)) {
+    progress.pipelines_done.fetch_add(1, std::memory_order_relaxed);
   }
 }
 

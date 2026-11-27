@@ -1571,6 +1571,50 @@ void DXBCShaderTranslator::ProcessTextureFetchInstruction(
     PopSystemTemp();
   }
 
+  // Runs on the filtered texel in 0...1, before the fetch constant's exponent adjustment.
+  if (instr.opcode == FetchOpcode::kTextureFetch && IsPixelShader() &&
+      GetDXBCShaderModification().pixel.sharpen_texture_edges) {
+    // Bitmap text magnified past its texel size turns into a soft ramp. Re-steepen the ramp
+    // around kThreshold toward kEdgePixels render pixels, using the value's own screen-space
+    // rate of change (fwidth): resolution independent, never softer than the original. The
+    // steepening is capped at kMaxScale and the threshold is low because thin strokes of a small
+    // antialiased font peak well below 0.5 once magnified; a hard cut erases them.
+    constexpr f32 kEdgePixels = 2.0f;
+    constexpr f32 kThreshold = 0.25f;
+    constexpr f32 kMaxScale = 4.0f;
+    const u32 mask = used_result_nonzero_components;
+    const u32 width_temp = PushSystemTemp();
+    const u32 dy_temp = PushSystemTemp();
+    a_.OpDerivRTXFine(dxbc::Dest::R(width_temp, mask), dxbc::Src::R(system_temp_result_));
+    a_.OpDerivRTYFine(dxbc::Dest::R(dy_temp, mask), dxbc::Src::R(system_temp_result_));
+    a_.OpAdd(dxbc::Dest::R(width_temp, mask), dxbc::Src::R(width_temp).Abs(),
+             dxbc::Src::R(dy_temp).Abs());
+    a_.OpMul(dxbc::Dest::R(width_temp, mask), dxbc::Src::R(width_temp),
+             dxbc::Src::LF(kEdgePixels));
+    a_.OpMax(dxbc::Dest::R(width_temp, mask), dxbc::Src::R(width_temp),
+             dxbc::Src::LF(1.0f / 1024.0f));
+    a_.OpRcp(dxbc::Dest::R(width_temp, mask), dxbc::Src::R(width_temp));
+    a_.OpMax(dxbc::Dest::R(width_temp, mask), dxbc::Src::R(width_temp), dxbc::Src::LF(1.0f));
+    a_.OpMin(dxbc::Dest::R(width_temp, mask), dxbc::Src::R(width_temp),
+             dxbc::Src::LF(kMaxScale));
+    if (instr.attributes.use_register_lod) {
+      // A fetch from a coarser mip is a deliberately blurred copy (a glow or a shadow behind
+      // the letters): leave it soft. Scale = 1 + (scale - 1) * (register LOD < 0.5).
+      a_.OpLT(dxbc::Dest::R(dy_temp, 0b0001),
+              dxbc::Src::R(system_temp_grad_h_lod_, dxbc::Src::kWWWW), dxbc::Src::LF(0.5f));
+      a_.OpAnd(dxbc::Dest::R(dy_temp, 0b0001), dxbc::Src::R(dy_temp, dxbc::Src::kXXXX),
+               dxbc::Src::LU(0x3F800000));
+      a_.OpAdd(dxbc::Dest::R(width_temp, mask), dxbc::Src::R(width_temp), dxbc::Src::LF(-1.0f));
+      a_.OpMAd(dxbc::Dest::R(width_temp, mask), dxbc::Src::R(width_temp),
+               dxbc::Src::R(dy_temp, dxbc::Src::kXXXX), dxbc::Src::LF(1.0f));
+    }
+    a_.OpAdd(dxbc::Dest::R(system_temp_result_, mask), dxbc::Src::R(system_temp_result_),
+             dxbc::Src::LF(-kThreshold));
+    a_.OpMAd(dxbc::Dest::R(system_temp_result_, mask), dxbc::Src::R(system_temp_result_),
+             dxbc::Src::R(width_temp), dxbc::Src::LF(kThreshold), true);
+    PopSystemTemp(2);
+  }
+
   if (instr.opcode == FetchOpcode::kTextureFetch) {
     u32 exp_adjust_temp = PushSystemTemp();
     a_.OpIBFE(dxbc::Dest::R(exp_adjust_temp, 0b0001), dxbc::Src::LU(6), dxbc::Src::LU(13),
@@ -1581,6 +1625,7 @@ void DXBCShaderTranslator::ProcessTextureFetchInstruction(
     a_.OpMul(dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
              dxbc::Src::R(system_temp_result_), dxbc::Src::R(exp_adjust_temp, dxbc::Src::kXXXX));
     PopSystemTemp();
+
   }
 
   u32 used_result_zero_components = used_result_components & ~used_result_nonzero_components;

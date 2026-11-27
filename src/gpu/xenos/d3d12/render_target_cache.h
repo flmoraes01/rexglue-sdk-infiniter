@@ -24,6 +24,7 @@
 
 #include <rex/hash.h>
 #include <rex/assert.h>
+#include "gpu/xenos/d3d12/dlss_pass.h"
 #include "gpu/xenos/d3d12/shared_memory.h"
 #include "gpu/xenos/d3d12/texture_cache.h"
 #include "gpu/xenos/pipeline/render_target/cache.h"
@@ -90,6 +91,34 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   bool Resolve(IPhysicalMemory& memory, D3D12SharedMemory& shared_memory,
                D3D12TextureCache& texture_cache, u32& written_address_out, u32& written_length_out);
 
+  /** Counts a draw for the resolve trace (gpu.xenos.log_resolves). */
+  void NoteDrawForResolveTrace() { ++resolve_trace_draws_; }
+
+  // DLSS: the render targets of the last scene draw, used when the scene is resolved.
+  void NoteDlssSceneDraw();
+  void ResetDlssScene() {
+    dlss_scene_targets_[0] = nullptr;
+    dlss_scene_targets_[1] = nullptr;
+  }
+  /**
+   * Fills the colour and depth targets of a DLSS pass for a resolve of the scene, after submitting
+   * pending barriers. False when the resolve does not read the recorded scene targets.
+   */
+  bool GetDlssSceneTargets(const draw_state::ResolveRequest& resolve_info,
+                           DlssPass::Inputs& inputs, std::string& why_not);
+  /** Adds a draw's line to the resolve trace (gpu.xenos.log_resolve_draws). */
+  void TraceDraw(std::string_view line, u64 pixel_shader_hash) {
+    // The set of pixel shaders joins the signature, so a screen that only adds UI is logged.
+    if (std::find(resolve_trace_shader_list_.begin(), resolve_trace_shader_list_.end(),
+                  pixel_shader_hash) == resolve_trace_shader_list_.end()) {
+      resolve_trace_shader_list_.push_back(pixel_shader_hash);
+    }
+    resolve_trace_ += "\n      ";
+    resolve_trace_ += line;
+  }
+  /** Ends a frame of the resolve trace, logging it when its sequence differs from the last one. */
+  void EndFrameResolveTrace(u64 frame, u32 frontbuffer_ptr, u32 width, u32 height);
+
   bool IsGammaRenderTargetAsUnorm16() const { return gamma_render_target_as_unorm16_; }
 
   /**
@@ -125,6 +154,19 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   void RequestPixelShaderInterlockBarrier() override;
 
  private:
+  void TraceResolve(const draw_state::ResolveRequest& resolve_info);
+
+  // gpu.xenos.log_resolves state: this frame's lines, draws since the last resolve, and the hash of
+  // the last logged frame's sequence (sizes and formats only, so moving addresses do not repeat it).
+  RenderTarget* dlss_scene_targets_[2] = {};  // depth, colour 0
+  std::string resolve_trace_;
+  u64 resolve_trace_signature_ = 0xCBF29CE484222325ull;
+  std::vector<u64> resolve_trace_shader_list_;
+  u64 resolve_trace_last_signature_ = 0;
+  u32 resolve_trace_count_ = 0;
+  u32 resolve_trace_draws_ = 0;
+  u32 resolve_trace_frame_draws_ = 0;
+
   /** Ordered by barrier strength. */
   enum class EDRAMBufferModificationStatus : u8 {
     kUnmodified,
@@ -225,6 +267,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       return descriptor_load_separate_;
     }
 
+    D3D12_RESOURCE_STATES GetResourceState() const { return resource_state_; }
     D3D12_RESOURCE_STATES SetResourceState(D3D12_RESOURCE_STATES new_state) {
       D3D12_RESOURCE_STATES old_state = resource_state_;
       resource_state_ = new_state;

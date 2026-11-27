@@ -264,6 +264,12 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
       } break;
       case Command::kCallback: {
         callbacks_[*reinterpret_cast<const size_t*>(stream)](command_list);
+        current_pipeline_state = nullptr;
+      } break;
+      case Command::kHostCall: {
+        auto& args = *reinterpret_cast<const HostCallArguments*>(stream);
+        args.callback(args.user, command_list);
+        current_pipeline_state = nullptr;
       } break;
       case Command::kInsertDebugMarker: {
         auto& args = *reinterpret_cast<const DebugMarkerHeader*>(stream);

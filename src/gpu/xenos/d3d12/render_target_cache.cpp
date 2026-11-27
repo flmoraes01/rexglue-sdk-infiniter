@@ -15,6 +15,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <format>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -1065,6 +1066,142 @@ void D3D12RenderTargetCache::WriteEDRAMUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTO
                                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 
+void D3D12RenderTargetCache::TraceResolve(const draw_state::ResolveRequest& resolve_info) {
+  // Bitfields are copied out first: std::format takes its arguments by reference.
+  const bool depth = resolve_info.IsCopyingDepth();
+  const draw_state::ResolveEDRAMLayout edram =
+      depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
+  const u32 source = resolve_info.rb_copy_control.copy_src_select;
+  const u32 rt_format = edram.format;
+  const u32 msaa = 1u << static_cast<u32>(edram.msaa_samples);
+  const u32 base = edram.base_tiles;
+  const u32 pitch = edram.pitch_tiles;
+  const u32 width = resolve_info.coordinate_info.width_div_8 * 8;
+  const u32 height = resolve_info.height_div_8 * 8;
+  const u32 copy_command = static_cast<u32>(resolve_info.rb_copy_control.copy_command);
+  const u32 dest_format = static_cast<u32>(resolve_info.copy_dest_info.copy_dest_format);
+  const i32 exp_bias = resolve_info.copy_dest_info.copy_dest_exp_bias;
+  const u32 dest_pitch = resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32;
+  resolve_trace_ += std::format(
+      "\n  #{:<3} draws {:<4} {} rt_fmt {:<2} msaa {} edram base {:<4} pitch {:<3} {}x{} -> "
+      "dest {:08X} fmt {:<2} exp_bias {:<3} pitch {} len {:X}{}{}{}",
+      resolve_trace_count_, resolve_trace_draws_,
+      depth ? std::string("DEPTH") : std::format("C{}   ", source), rt_format, msaa, base, pitch,
+      width, height, resolve_info.copy_dest_base, dest_format, exp_bias, dest_pitch,
+      resolve_info.copy_dest_extent_length,
+      copy_command ? std::format(" cmd {}", copy_command) : std::string(),
+      resolve_info.IsClearingColor() ? " +clear_color" : "",
+      resolve_info.IsClearingDepth() ? " +clear_depth" : "");
+  // FNV-1a over what identifies a pass, not where it lands.
+  const u64 key[] = {depth, rt_format, msaa, width, height, dest_format,
+                     resolve_trace_draws_ ? 1u : 0u};
+  for (u64 value : key) {
+    resolve_trace_signature_ = (resolve_trace_signature_ ^ value) * 0x100000001B3ull;
+  }
+  resolve_trace_frame_draws_ += resolve_trace_draws_;
+  resolve_trace_draws_ = 0;
+  ++resolve_trace_count_;
+}
+
+void D3D12RenderTargetCache::NoteDlssSceneDraw() {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return;
+  }
+  // Kept separately: late scene draws may bind only a colour target (screen-space effects) or
+  // only depth, and the pass needs the last of each.
+  RenderTarget* const* targets = GetLastUpdateAccumulatedRenderTargets();
+  for (u32 i = 0; i < 2; ++i) {
+    if (targets[i]) {
+      dlss_scene_targets_[i] = targets[i];
+    }
+  }
+}
+
+bool D3D12RenderTargetCache::GetDlssSceneTargets(const draw_state::ResolveRequest& resolve_info,
+                                                 DlssPass::Inputs& inputs, std::string& why_not) {
+  auto* depth = static_cast<D3D12RenderTarget*>(dlss_scene_targets_[0]);
+  auto* color = static_cast<D3D12RenderTarget*>(dlss_scene_targets_[1]);
+  if (GetPath() != Path::kHostRenderTargets) {
+    why_not = "render targets are not host render targets";
+    return false;
+  }
+  if (!color || !depth) {
+    why_not = std::format("the last full-frame draw had no {}",
+                          !color ? "colour render target" : "depth buffer");
+    return false;
+  }
+  const RenderTargetKey color_key = color->GetKey();
+  const RenderTargetKey depth_key = depth->GetKey();
+  if (color_key.is_depth || !depth_key.is_depth || color_key.Is64bpp() ||
+      color_key.msaa_samples != xenos::MSAASamples::k1X ||
+      depth_key.msaa_samples != xenos::MSAASamples::k1X ||
+      color_key.base_tiles != resolve_info.color_edram_info.base_tiles) {
+    why_not = std::format(
+        "scene targets do not fit: colour base {} {}x MSAA{}, depth base {} {}x MSAA, resolve "
+        "base {}",
+        static_cast<u32>(color_key.base_tiles), 1u << static_cast<u32>(color_key.msaa_samples),
+        color_key.Is64bpp() ? " 64bpp" : "", static_cast<u32>(depth_key.base_tiles),
+        1u << static_cast<u32>(depth_key.msaa_samples),
+        static_cast<u32>(resolve_info.color_edram_info.base_tiles));
+    return false;
+  }
+  const u32 scale_x = GetDrawResolutionScaleX();
+  const u32 scale_y = GetDrawResolutionScaleY();
+  // The resolve starts at the render target's base tile; both targets cover the same screen area.
+  const u32 x = resolve_info.coordinate_info.edram_offset_x_div_8 * 8 * scale_x;
+  const u32 y = resolve_info.coordinate_info.edram_offset_y_div_8 * 8 * scale_y;
+  command_processor_.SubmitBarriers();
+  inputs.color = color->GetResource();
+  inputs.color_state = color->GetResourceState();
+  inputs.color_x = x;
+  inputs.color_y = y;
+  inputs.depth = depth->GetResource();
+  inputs.depth_state = depth->GetResourceState();
+  inputs.depth_x = x;
+  inputs.depth_y = y;
+  inputs.width = resolve_info.coordinate_info.width_div_8 * 8 * scale_x;
+  inputs.height = resolve_info.height_div_8 * 8 * scale_y;
+  return true;
+}
+
+void D3D12RenderTargetCache::EndFrameResolveTrace(u64 frame, u32 frontbuffer_ptr, u32 width,
+                                                  u32 height) {
+  if (!command_processor_.GetXenosSettings().log_resolves.Get()) {
+    resolve_trace_.clear();
+    resolve_trace_count_ = resolve_trace_draws_ = resolve_trace_frame_draws_ = 0;
+    return;
+  }
+  std::sort(resolve_trace_shader_list_.begin(), resolve_trace_shader_list_.end());
+  for (u64 hash : resolve_trace_shader_list_) {
+    resolve_trace_signature_ = (resolve_trace_signature_ ^ hash) * 0x100000001B3ull;
+  }
+  resolve_trace_shader_list_.clear();
+  const i32 every = command_processor_.GetXenosSettings().log_frame_every.Get();
+  if (resolve_trace_signature_ != resolve_trace_last_signature_ ||
+      (every > 0 && frame % static_cast<u64>(every) == 0)) {
+    REXGPU_INFO("resolve trace, frame {}: {} resolves, {} draws ({} after the last), swap {:08X} "
+                "{}x{}",
+                frame, resolve_trace_count_, resolve_trace_frame_draws_ + resolve_trace_draws_,
+                resolve_trace_draws_, frontbuffer_ptr, width, height);
+    // One message per line: the logger drops very long messages.
+    std::string_view rest = resolve_trace_;
+    while (!rest.empty()) {
+      const size_t start = rest.find_first_not_of('\n');
+      if (start == std::string_view::npos) {
+        break;
+      }
+      rest.remove_prefix(start);
+      const size_t end = rest.find('\n');
+      REXGPU_INFO("{}", rest.substr(0, end));
+      rest.remove_prefix(end == std::string_view::npos ? rest.size() : end);
+    }
+    resolve_trace_last_signature_ = resolve_trace_signature_;
+  }
+  resolve_trace_.clear();
+  resolve_trace_signature_ = 0xCBF29CE484222325ull;
+  resolve_trace_count_ = resolve_trace_draws_ = resolve_trace_frame_draws_ = 0;
+}
+
 bool D3D12RenderTargetCache::Resolve(IPhysicalMemory& memory, D3D12SharedMemory& shared_memory,
                                      D3D12TextureCache& texture_cache, u32& written_address_out,
                                      u32& written_length_out) {
@@ -1085,6 +1222,13 @@ bool D3D12RenderTargetCache::Resolve(IPhysicalMemory& memory, D3D12SharedMemory&
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
     return true;
   }
+
+  if (command_processor_.GetXenosSettings().log_resolves.Get()) {
+    TraceResolve(resolve_info);
+  }
+
+  // DLSS runs on the scene render target before the resolve reads it.
+  command_processor_.RunDlssBeforeResolve(resolve_info);
 
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
 

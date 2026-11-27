@@ -69,7 +69,7 @@ class DXBCShaderTranslator : public ShaderTranslator {
      * Layout version in 0xYYYYMMDD form, increased on incompatible changes to invalidate pipeline
      * storage.
      */
-    static constexpr u32 kVersion = 0x20260226;
+    static constexpr u32 kVersion = 0x2026111A;
 
     // NOLINTNEXTLINE(performance-enum-size): packed key bit field, MSVC packs per type
     enum class DepthStencilMode : u32 {
@@ -120,6 +120,11 @@ class DXBCShaderTranslator : public ShaderTranslator {
       u32 dynamic_addressable_register_count : 8;
       /** Used without ROV only. */
       DepthStencilMode depth_stencil_mode : 2;
+      /**
+       * Sharpens the edges of texture fetch results by their screen-space rate of change, for
+       * magnified bitmap text (gpu.xenos.text_sharpen). Set only for shaders the title lists.
+       */
+      u32 sharpen_texture_edges : 1;
     } pixel;
 
     explicit Modification(u64 modification_value = 0) : value(modification_value) {

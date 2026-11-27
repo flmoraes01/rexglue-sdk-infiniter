@@ -15,12 +15,14 @@
 #include <functional>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include <rex/hash.h>
 #include <rex/assert.h>
 #include <rex/types.h>
+#include "gpu/xenos/d3d12/texture_replacement.h"
 #include "gpu/xenos/d3d12/shader.h"
 #include "gpu/xenos/d3d12/shared_memory.h"
 #include "gpu/xenos/pipeline/texture/cache.h"
@@ -50,6 +52,7 @@ class D3D12TextureCache final : public TextureCache {
     TextureKey key;
     u32 host_swizzle;
     u8 swizzled_signs;
+    u32 replacement_generation;  // changes when the texture starts or stops showing a pack file
   };
 
   union SamplerParameters {
@@ -225,6 +228,13 @@ class D3D12TextureCache final : public TextureCache {
   std::unique_ptr<Texture> CreateTexture(TextureKey key) override;
 
   /** Binds pipelines, allocates descriptors and copies the texture data. */
+  /** Hashes a freshly loaded base level, dumps it and picks its texture pack replacement. */
+  void UpdateTextureReplacement(Texture& texture);
+  // Applies finished overlay composites, or a changed overlay set, to loaded textures.
+  void UpdateTextureOverlays();
+  // The replacement a loaded texture shows: a composite with the overlay set, else a pack file.
+  const TextureReplacement::Replacement* ChooseReplacement(Texture& texture, u64 hash,
+                                                           D3D12_RESOURCE_STATES state);
   bool LoadHostTextureDataFromResidentMemory(Texture& texture, bool load_base,
                                              bool load_mips) override;
 
@@ -266,6 +276,7 @@ class D3D12TextureCache final : public TextureCache {
         u32 is_signed : 1;
         u32 host_swizzle : 12;
         u32 dimension : 2;
+        u32 replaced : 1;  // the view of the texture pack's replacement
       };
 
       SRVDescriptorKey() : key(0) { REX_STATIC_ASSERT_SIZE(*this, sizeof(key)); }
@@ -299,10 +310,38 @@ class D3D12TextureCache final : public TextureCache {
       srv_descriptors_.emplace(descriptor_key, descriptor_index);
     }
 
+    /** The texture pack file shown instead of the guest data, or null. */
+    const TextureReplacement::Replacement* GetReplacement() const { return replacement_; }
+    u32 GetReplacementGeneration() const { return replacement_generation_; }
+    /**
+     * Notes the hash of newly loaded content; true once the content has changed often enough to be
+     * a video or another texture the title rewrites, which packs leave alone.
+     */
+    u64 GetContentHash() const { return content_hash_; }
+    bool NoteContentHash(u64 hash) {
+      if (content_hash_ != hash) {
+        if (content_hash_ != 0) {
+          ++content_changes_;
+        }
+        content_hash_ = hash;
+      }
+      return content_changes_ > 3;
+    }
+    void SetReplacement(const TextureReplacement::Replacement* replacement) {
+      if (replacement != replacement_) {
+        replacement_ = replacement;
+        ++replacement_generation_;
+      }
+    }
+
    private:
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
     std::unique_ptr<D3D12Texture> texture_3d_as_2d_;
+    const TextureReplacement::Replacement* replacement_ = nullptr;
+    u32 replacement_generation_ = 0;
+    u64 content_hash_ = 0;
+    u32 content_changes_ = 0;
 
     /** Bindful uses the non shader visible cache, bindless the global shader visible heap. */
     std::unordered_map<SRVDescriptorKey, u32, SRVDescriptorKey::Hasher> srv_descriptors_;
@@ -451,6 +490,11 @@ class D3D12TextureCache final : public TextureCache {
   static const HostFormat kHostFormats[64];
 
   D3D12CommandProcessor& command_processor_;
+  // Texture packs: dumping and replacement by content hash.
+  TextureReplacement texture_replacement_{command_processor_};
+  // Textures that have an overlay in some set, by key, for UpdateTextureOverlays.
+  std::unordered_set<TextureKey, TextureKey::Hasher> overlay_textures_;
+  u32 overlay_generation_seen_ = 0;
   bool bindless_resources_used_;
 
   Microsoft::WRL::ComPtr<ID3D12RootSignature> load_root_signature_;
