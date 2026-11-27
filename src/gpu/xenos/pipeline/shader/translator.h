@@ -79,6 +79,10 @@ class REX_GPU_XENOS_API ShaderTranslator : public rex::NonCopyable {
 
   /** Called at the start of translation after the vertex and texture bindings are gathered. */
   virtual void StartTranslation() {}
+  // The control flow is translated this many times in a row (a vertex shader variant computing
+  // the previous frame's position first); StartTranslationPass runs before every pass but the first.
+  virtual u32 GetTranslationPassCount() const { return 1; }
+  virtual void StartTranslationPass([[maybe_unused]] u32 pass) {}
 
   /** Called at the end of translation after all ucode is processed. */
   virtual std::vector<u8> CompleteTranslation() { return std::vector<u8>(); }

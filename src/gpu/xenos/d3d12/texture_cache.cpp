@@ -1852,6 +1852,8 @@ bool D3D12TextureCache::LoadHostTextureDataFromResidentMemory(Texture& texture, 
     if (static_cast<u32>(guest_format) == spec.depth_format) {
       dlss_scene_depth_key_ = texture_key;
       dlss_scene_depth_key_valid_ = true;
+      command_processor_.NoteDlssSceneDepthAddress(texture_key.base_page
+                                                   << xenos::kTextureSubresourceAlignmentBytesLog2);
     } else if (static_cast<u32>(guest_format) == spec.color_format && dlss_scene_depth_key_valid_) {
       if (Texture* scene_depth = FindOrCreateTexture(dlss_scene_depth_key_);
           scene_depth != nullptr && LoadTextureData(*scene_depth)) {

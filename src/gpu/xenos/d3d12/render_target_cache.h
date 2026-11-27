@@ -127,6 +127,13 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
    */
   bool IsFixed16TruncatedToMinus1To1() const;
 
+  /**
+   * ROV: makes the drawing so far visible to a host compute pass that reads and writes the EDRAM
+   * buffer (the motion region after EDRAM) and returns the buffer, in the UAV state. The caller
+   * submits the barriers.
+   */
+  ID3D12Resource* BeginEDRAMHostAccess();
+
   bool IsDepthFloat24Rounded() const { return depth_float24_round_; }
   bool IsDepthFloat24ConvertedInPixelShader() const {
     return depth_float24_convert_in_pixel_shader_;

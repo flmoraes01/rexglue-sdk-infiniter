@@ -104,6 +104,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   /** Runs DLSS on the scene render target when this resolve ends the title's 3D scene. */
   void RunDlssBeforeResolve(const draw_state::ResolveRequest& resolve_info);
 
+  /** Texture mode: the guest address of the scene depth texture, where its resolves go. */
+  void NoteDlssSceneDepthAddress(u32 address) { dlss_scene_depth_address_ = address; }
+
   /** Texture mode (gpu.d3d12.dlss_scene_texture): the scene colour and depth as loaded. */
   struct DlssSceneTextureSpec {
     u32 width = 0, height = 0, color_format = 0, depth_format = 0;
@@ -582,6 +585,39 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool dlss_ran_this_frame_ = false;
   bool dlss_ran_last_frame_ = false;
   bool dlss_jitter_draw_ = false;
+  // Object motion vectors (texture mode, ROV): the draw uses the motion vector shader variants,
+  // with the vertex float constants it had in the previous frame after the current ones.
+  bool dlss_motion_draw_ = false;
+  // Its previous constants were found (same shader, vertex buffer and order among such draws).
+  bool dlss_motion_valid_ = false;
+  std::vector<u32> dlss_motion_current_constants_;
+  const std::vector<u32>* dlss_motion_previous_constants_ = nullptr;
+  // Packed vertex float constants of this frame's and the previous frame's motion draws.
+  std::unordered_map<u64, std::vector<u32>> dlss_motion_constants_[2];
+  std::unordered_map<u64, u32> dlss_motion_occurrences_;
+  u32 dlss_motion_frame_ = 0;
+  // The scene draws' host viewport, for motion in NDC to pixels.
+  u32 dlss_motion_viewport_[2] = {};
+  u32 dlss_scene_depth_address_ = 0;
+  // Object motion copies out of EDRAM this frame (one per depth resolve of the scene).
+  u32 dlss_motion_copies_ = 0;
+  struct DlssMotionCopyCall {
+    D3D12CommandProcessor* processor;
+    ID3D12Resource* edram;
+    u32 edram_size_bytes;
+    DlssPass::MotionCopy copy;
+    u32 scene_width;
+    u32 scene_height;
+  };
+  std::vector<std::unique_ptr<DlssMotionCopyCall>> dlss_motion_copy_calls_;
+  static void DlssMotionCopyHostCall(void* user, ID3D12GraphicsCommandList* command_list);
+  // Texture mode: copies the object motion of a scene depth resolve's region out of EDRAM.
+  void CopyDlssSceneMotion(const draw_state::ResolveRequest& resolve_info);
+  void NoteDlssMotionDraw(const Shader& vertex_shader, const Shader* pixel_shader,
+                          const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+                          bool memexport_used, xenos::reg::RB_DEPTHCONTROL normalized_depth_control,
+                          DXBCShaderTranslator::Modification& vertex_shader_modification,
+                          DXBCShaderTranslator::Modification& pixel_shader_modification);
   // Super Resolution: scene draws are squeezed into the top-left render_ratio of the target.
   bool dlss_shrink_draw_ = false;
   f32 dlss_render_ratio_ = 1.0f;  // of the current frame

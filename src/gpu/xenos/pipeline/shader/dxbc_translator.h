@@ -69,7 +69,7 @@ class DXBCShaderTranslator : public ShaderTranslator {
      * Layout version in 0xYYYYMMDD form, increased on incompatible changes to invalidate pipeline
      * storage.
      */
-    static constexpr u32 kVersion = 0x2026111A;
+    static constexpr u32 kVersion = 0x2026112F;
 
     // NOLINTNEXTLINE(performance-enum-size): packed key bit field, MSVC packs per type
     enum class DepthStencilMode : u32 {
@@ -106,6 +106,13 @@ class DXBCShaderTranslator : public ShaderTranslator {
       /** Value of PA_CL_CLIP_CNTL::ps_ucp_mode for point primitives. */
       u32 point_ps_ucp_mode : 2;
       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
+      /**
+       * Motion vectors for temporal upscalers: the shader also runs with the previous frame's float
+       * constants (after the current ones in the buffer) and writes the current and previous clip
+       * x, y and w to two outputs after the interpolators (TEXCOORD kMotionSemanticIndex and the
+       * next one).
+       */
+      u32 motion_vectors : 1;
     } vertex;
     struct PixelShaderModification {
       u32 interpolator_mask : xenos::kMaxInterpolators;
@@ -125,6 +132,12 @@ class DXBCShaderTranslator : public ShaderTranslator {
        * magnified bitmap text (gpu.xenos.text_sharpen). Set only for shaders the title lists.
        */
       u32 sharpen_texture_edges : 1;
+      /**
+       * ROV only: writes the motion from the vertex shader's motion outputs (see the vertex
+       * modification) for the first sample, as the previous minus the current NDC position in two
+       * halves, to the motion region after EDRAM. All ones when kSysFlagMotionValid is clear.
+       */
+      u32 motion_vectors : 1;
     } pixel;
 
     explicit Modification(u64 modification_value = 0) : value(modification_value) {
@@ -179,6 +192,8 @@ class DXBCShaderTranslator : public ShaderTranslator {
      * coverage are disabled. Ignored when the shader has kill instructions or writes depth.
      */
     kSysFlagROVDepthStencilEarlyWriteShift,
+    /** The motion vector shader variants got the draw's previous constants. */
+    kSysFlagMotionValidShift,
 
     kSysFlagCount,
 
@@ -203,6 +218,7 @@ class DXBCShaderTranslator : public ShaderTranslator {
     kSysFlagROVDepthWrite = 1u << kSysFlagROVDepthWriteShift,
     kSysFlagROVStencilTest = 1u << kSysFlagROVStencilTestShift,
     kSysFlagROVDepthStencilEarlyWrite = 1u << kSysFlagROVDepthStencilEarlyWriteShift,
+    kSysFlagMotionValid = 1u << kSysFlagMotionValidShift,
   };
   static_assert(kSysFlagCount <= 32, "Too many flags in the system constants");
 
@@ -570,6 +586,8 @@ class DXBCShaderTranslator : public ShaderTranslator {
   u32 GetModificationRegisterCount() const override;
 
   void StartTranslation() override;
+  u32 GetTranslationPassCount() const override;
+  void StartTranslationPass(u32 pass) override;
   std::vector<u8> CompleteTranslation() override;
   void PostTranslation() override;
 
@@ -783,6 +801,18 @@ class DXBCShaderTranslator : public ShaderTranslator {
   void RemapAndConvertVertexIndices(u32 dest_temp, u32 dest_temp_components, const dxbc::Src& src);
   void StartVertexShaderLoadVertexIndex();
   void StartVertexOrDomainShader();
+  bool IsMotionVectorVertexShader() const;
+  /** Registers after the interpolators for the motion vector variants (0 or 2). */
+  u32 GetMotionRegisterCount() const;
+  /** Semantic index of the first motion register, after any interpolator's. */
+  static constexpr u32 kMotionSemanticIndex = xenos::kMaxInterpolators;
+  /** Float constants in the buffer: twice the shader's with the previous ones of motion vectors. */
+  u32 GetFloatConstantBufferCount() const;
+  // The loop around the translated control flow, opened after the shader prologue.
+  void OpenControlFlowLoop();
+  void CloseControlFlowLoop();
+  // Divides or multiplies the position in `position_temp` by W as the vertex format flags say.
+  void ApplyVertexPositionFormat(u32 position_temp);
   /**
    * Loads the ROV sample coverage and EDRAM addressing parameters.
    *
@@ -802,6 +832,8 @@ class DXBCShaderTranslator : public ShaderTranslator {
   void StartPixelShader();
 
   void CompleteVertexOrDomainShader();
+  // Motion vector pixel shaders on ROV: the motion of the first sample, if it passed.
+  void CompletePixelShaderWriteMotion();
   /**
    * Tests a sample against alpha to mask.
    *
@@ -1029,6 +1061,9 @@ class DXBCShaderTranslator : public ShaderTranslator {
   u64 system_constants_used_;
 
   u32 out_reg_vs_interpolators_;
+  // The two motion registers of the motion vector variants, UINT32_MAX without them.
+  u32 out_reg_vs_motion_;
+  u32 in_reg_ps_motion_;
   u32 out_reg_vs_position_;
   /**
    * Clip and cull distances are tightly packed with up to 6 SV_ClipDistance or SV_CullDistance
@@ -1055,6 +1090,10 @@ class DXBCShaderTranslator : public ShaderTranslator {
 
   u32 system_temp_position_;
   u32 system_temp_point_size_edge_flag_kill_vertex_;
+  // Motion vector vertex shaders: the position from the pass with the previous constants, and the
+  // offset of those constants in the float constant buffer while that pass is translated.
+  u32 system_temp_motion_previous_position_;
+  u32 float_constant_pass_offset_;
   /**
    * ROV only, 4 persistent VGPRs when writing color targets and 2 otherwise.
    *

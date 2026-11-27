@@ -562,18 +562,25 @@ bool ShaderTranslator::TranslateAnalyzedShader(Shader::Translation& translation)
 
   u32 cf_pair_index_bound = shader.GetCFPairIndexBound();
   const std::set<u32>& label_addresses = shader.GetLabelAddresses();
-  for (u32 i = 0; i < cf_pair_index_bound; ++i) {
-    ControlFlowInstruction cf_ab[2];
-    UnpackControlFlowInstructions(ucode_dwords + size_t{i} * 3, cf_ab);
-    for (u32 j = 0; j < 2; ++j) {
-      u32 cf_index = i * 2 + j;
-      cf_index_ = cf_index;
-      if (label_addresses.find(cf_index) != label_addresses.end()) {
-        ProcessLabel(cf_index);
+  const u32 pass_count = GetTranslationPassCount();
+  for (u32 pass = 0; pass < pass_count; ++pass) {
+    if (pass) {
+      previous_vfetch_full_ = {};
+      StartTranslationPass(pass);
+    }
+    for (u32 i = 0; i < cf_pair_index_bound; ++i) {
+      ControlFlowInstruction cf_ab[2];
+      UnpackControlFlowInstructions(ucode_dwords + size_t{i} * 3, cf_ab);
+      for (u32 j = 0; j < 2; ++j) {
+        u32 cf_index = i * 2 + j;
+        cf_index_ = cf_index;
+        if (label_addresses.find(cf_index) != label_addresses.end()) {
+          ProcessLabel(cf_index);
+        }
+        ProcessControlFlowInstructionBegin(cf_index);
+        TranslateControlFlowInstruction(cf_ab[j]);
+        ProcessControlFlowInstructionEnd(cf_index);
       }
-      ProcessControlFlowInstructionBegin(cf_index);
-      TranslateControlFlowInstruction(cf_ab[j]);
-      ProcessControlFlowInstructionEnd(cf_index);
     }
   }
 

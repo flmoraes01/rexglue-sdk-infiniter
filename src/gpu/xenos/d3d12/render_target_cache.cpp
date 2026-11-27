@@ -167,8 +167,11 @@ bool D3D12RenderTargetCache::Initialize() {
     path_ = Path::kHostRenderTargets;
   }
 
-  u32 edram_buffer_size =
-      xenos::kEDRAMSizeBytes * (GetDrawResolutionScaleX() * GetDrawResolutionScaleY());
+  // With ROV, a region as big as EDRAM follows it for the motion of each depth sample (written
+  // by the motion vector pixel shaders, see DXBCShaderTranslator::Modification).
+  u32 edram_buffer_size = xenos::kEDRAMSizeBytes *
+                          (GetDrawResolutionScaleX() * GetDrawResolutionScaleY()) *
+                          (path_ == Path::kPixelShaderInterlock ? 2 : 1);
   D3D12_RESOURCE_DESC edram_buffer_desc;
   gpu::d3d12::objects::FillBufferResourceDesc(edram_buffer_desc, edram_buffer_size,
                                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -5122,6 +5125,13 @@ bool D3D12RenderTargetCache::DumpRenderTargets(u32 dump_base, u32 dump_row_lengt
     MarkEDRAMBufferModified();
   }
   return all_pipelines_available;
+}
+
+ID3D12Resource* D3D12RenderTargetCache::BeginEDRAMHostAccess() {
+  TransitionEDRAMBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  CommitEDRAMBufferUAVWrites(EDRAMBufferModificationStatus::kAsROV);
+  MarkEDRAMBufferModified(EDRAMBufferModificationStatus::kAsUAV);
+  return edram_buffer_;
 }
 
 bool D3D12RenderTargetCache::IsFixed16TruncatedToMinus1To1() const {

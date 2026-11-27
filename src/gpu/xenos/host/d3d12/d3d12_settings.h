@@ -128,6 +128,13 @@ class D3D12Settings : public SettingOwner {
   REX_SETTING(std::string, dlss_nr_debug, "off",
               "Neural Rendering debug view: off, difference (what the model changed, x16) or "
               "model (its raw answer)");
+  REX_SETTING(std::string, dlss_debug_view, "off",
+              "Debug view in place of the scene: off, motion (red and green the motion vectors "
+              "DLSS gets, blue where they are the scene draws' own; also logs the mean object and "
+              "camera motion about once a second)");
+  REX_SETTING(bool, dlss_object_motion, true,
+              "Texture mode with ROV: motion vectors of moving objects from each scene draw's "
+              "previous vertex constants (off: camera motion only)");
   REX_SETTING(bool, dlss_jitter, true,
               "Shift the scene by a sub-pixel amount each frame for DLSS (off only to debug)");
   REX_SETTING(bool, dlss_jitter_invert, false,

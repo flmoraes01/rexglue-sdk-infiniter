@@ -42,6 +42,11 @@ class DlssPass {
     // Linear colour is the stored colour times this (a resolve exponent bias, for a fixed-point
     // scene texture). Above 1 the chain runs on a linear float copy and DLSS in HDR mode.
     f32 color_scale = 1.0f;
+    // CopySceneMotion wrote this frame's object motion (texture mode): it replaces the camera
+    // motion where the scene draws wrote theirs.
+    bool object_motion = false;
+    // Shows the motion vectors instead of the scene (see dlss_motion_debug_cs).
+    bool debug_motion = false;
     ID3D12Resource* depth = nullptr;  // scene depth render target
     D3D12_RESOURCE_STATES depth_state = D3D12_RESOURCE_STATE_COMMON;
     u32 depth_x = 0;
@@ -98,6 +103,27 @@ class DlssPass {
 
   /** Loads NGX and checks DLSS support. Safe to call when DLSS is not built in. */
   bool Initialize(ID3D12Device* device);
+
+  /** Where one depth resolve's object motion goes (the shader's constants, in order). */
+  struct MotionCopy {
+    u32 base_tiles;
+    u32 pitch_tiles;
+    u32 sample_count_log2[2];
+    u32 tile_size[2];
+    u32 source_origin[2];
+    u32 size[2];
+    u32 dest_origin[2];
+    f32 ndc_to_pixels[2];
+    u32 motion_region;
+  };
+  /**
+   * Copies the object motion of a depth resolve's region out of the region after EDRAM (in the
+   * UAV state, edram_size_bytes including that region) into the scene_width x scene_height scene
+   * motion texture, and clears it in EDRAM.
+   */
+  void CopySceneMotion(ID3D12GraphicsCommandList* command_list, ID3D12Resource* edram,
+                       u32 edram_size_bytes, const MotionCopy& copy, u32 scene_width,
+                       u32 scene_height);
   void Shutdown();
   // False once a pass failed, so the scene stops being jittered and shrunk for nothing.
   bool IsAvailable() const { return available_ && !failed_; }
@@ -158,7 +184,8 @@ class DlssPass {
 
   // Descriptor slots of heap_.
   enum : u32 {
-    kSlotDepthSRV,     // inputs: the depth render target
+    kSlotDepthSRV,     // inputs: the depth render target (t0, t1 contiguous)
+    kSlotObjectMotionSRV,  // inputs: the scene motion texture
     kSlotDepthOutUAV,  // inputs: u0, u1 (contiguous)
     kSlotMotionOutUAV,
     kSlotSceneSRV,     // compose: the scene render target as the frame the model was given
@@ -186,6 +213,11 @@ class DlssPass {
     kSlotSceneLdrUAV,      // colour scale back: u0, u1 (u1 unused)
     kSlotSceneLdrUAVSpare,
     kSlotScaleSourceSRV,   // colour scale back: the chain's result
+    kSlotMotionCopyEdramUAV,  // motion copy: u0, u1 (contiguous)
+    kSlotMotionCopyOutUAV,
+    kSlotDebugOutUAV,  // motion debug: u0, u1 (contiguous)
+    kSlotDebugStatsUAV,
+    kSlotSpareSRV,  // so a two-descriptor table may start at the last slot
     kSlotCount,
   };
 
@@ -207,6 +239,20 @@ class DlssPass {
   // own format before the copy into it.
   Microsoft::WRL::ComPtr<ID3D12Resource> scene_hdr_;
   Microsoft::WRL::ComPtr<ID3D12Resource> scene_ldr_;
+  // Object motion of the scene in pixels (NaN where the camera motion applies), filled per tile.
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> motion_copy_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> motion_debug_pipeline_;
+  // The motion debug view's sums (see dlss_motion_debug_cs), read back and logged.
+  static constexpr u32 kMotionStatsBytes = 32;
+  Microsoft::WRL::ComPtr<ID3D12Resource> motion_stats_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> motion_stats_zero_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> motion_stats_readback_;
+  u64 motion_stats_frame_ = 0;
+  bool EnsureMotionStatsBuffers();
+  void RecordMotionStats(ID3D12GraphicsCommandList* command_list);
+  Microsoft::WRL::ComPtr<ID3D12Resource> scene_motion_;
+  u32 scene_motion_width_ = 0;
+  u32 scene_motion_height_ = 0;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> gi_root_signature_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> gi_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12Resource> gi_out_;

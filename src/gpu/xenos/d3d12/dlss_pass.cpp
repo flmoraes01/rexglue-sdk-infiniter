@@ -17,6 +17,8 @@
 #include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/cas_cs.h"
 #include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/dlss_color_scale_cs.h"
 #include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/dlss_inputs_cs.h"
+#include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/dlss_motion_copy_cs.h"
+#include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/dlss_motion_debug_cs.h"
 #include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/dlss_nr_compose_cs.h"
 #include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/smaa_blend_cs.h"
 #include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/ssgi_cs.h"
@@ -50,7 +52,10 @@ struct InputsConstants {
   f32 reproject[16];
   u32 depth_origin[2];
   u32 size[2];
+  u32 object_motion_valid;
 };
+static_assert(sizeof(DlssPass::MotionCopy) <= sizeof(InputsConstants),
+              "The motion copy constants share the root constants of the inputs");
 
 class Barriers {
  public:
@@ -119,7 +124,7 @@ bool DlssPass::Initialize(ID3D12Device* device) {
   device_ = device;
   D3D12_DESCRIPTOR_RANGE ranges[2] = {};
   ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  ranges[0].NumDescriptors = 1;
+  ranges[0].NumDescriptors = 2;
   ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
   ranges[1].NumDescriptors = 2;
   D3D12_ROOT_PARAMETER parameters[3] = {};
@@ -153,7 +158,14 @@ bool DlssPass::Initialize(ID3D12Device* device) {
   scale_pipeline_.Attach(objects::CreateComputePipeline(device, kDlssColorScaleCS,
                                                         sizeof(kDlssColorScaleCS),
                                                         root_signature_.Get()));
+  motion_copy_pipeline_.Attach(objects::CreateComputePipeline(device, kDlssMotionCopyCS,
+                                                              sizeof(kDlssMotionCopyCS),
+                                                              root_signature_.Get()));
+  motion_debug_pipeline_.Attach(objects::CreateComputePipeline(device, kDlssMotionDebugCS,
+                                                               sizeof(kDlssMotionDebugCS),
+                                                               root_signature_.Get()));
   if (!inputs_pipeline_ || !compose_pipeline_ || !cas_pipeline_ || !scale_pipeline_ ||
+      !motion_copy_pipeline_ || !motion_debug_pipeline_ ||
       !InitializeSmaa() ||
       !InitializeGi()) {
     REXGPU_WARN("DLSS: cannot create the compute pipelines");
@@ -363,6 +375,13 @@ void DlssPass::Shutdown() {
   scene_hdr_.Reset();
   scene_ldr_.Reset();
   scale_pipeline_.Reset();
+  motion_copy_pipeline_.Reset();
+  motion_debug_pipeline_.Reset();
+  motion_stats_.Reset();
+  motion_stats_zero_.Reset();
+  motion_stats_readback_.Reset();
+  scene_motion_.Reset();
+  scene_motion_width_ = scene_motion_height_ = 0;
   gi_pipeline_.Reset();
   gi_root_signature_.Reset();
   for (u32 i = 0; i < kFrameGenerationSlots; ++i) {
@@ -602,6 +621,63 @@ void DlssPass::Sharpen(ID3D12GraphicsCommandList* command_list, f32 sharpness, u
   command_list->Dispatch((width + 15) / 16, (height + 15) / 16, 1);
 }
 
+void DlssPass::CopySceneMotion(ID3D12GraphicsCommandList* command_list, ID3D12Resource* edram,
+                               u32 edram_size_bytes, const MotionCopy& copy, u32 scene_width,
+                               u32 scene_height) {
+  if (!available_ || !motion_copy_pipeline_ || !edram) {
+    return;
+  }
+  if (!scene_motion_ || scene_motion_width_ != scene_width ||
+      scene_motion_height_ != scene_height) {
+    // A resolution change means a restart, so nothing in flight uses the old texture.
+    scene_motion_.Reset();
+    scene_motion_width_ = scene_motion_height_ = 0;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = scene_width;
+    desc.Height = scene_height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(device_->CreateCommittedResource(
+            &objects::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&scene_motion_)))) {
+      REXGPU_WARN("DLSS: cannot create the {}x{} scene motion texture", scene_width, scene_height);
+      return;
+    }
+    scene_motion_width_ = scene_width;
+    scene_motion_height_ = scene_height;
+  }
+  if (copy.dest_origin[0] + copy.size[0] > scene_width ||
+      copy.dest_origin[1] + copy.size[1] > scene_height) {
+    return;
+  }
+  D3D12_UNORDERED_ACCESS_VIEW_DESC edram_uav = {};
+  edram_uav.Format = DXGI_FORMAT_R32_UINT;
+  edram_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  edram_uav.Buffer.NumElements = edram_size_bytes >> 2;
+  device_->CreateUnorderedAccessView(edram, nullptr, &edram_uav,
+                                     CpuDescriptor(kSlotMotionCopyEdramUAV));
+  device_->CreateUnorderedAccessView(scene_motion_.Get(), nullptr, nullptr,
+                                     CpuDescriptor(kSlotMotionCopyOutUAV));
+  ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
+  command_list->SetDescriptorHeaps(1, heaps);
+  command_list->SetComputeRootSignature(root_signature_.Get());
+  command_list->SetPipelineState(motion_copy_pipeline_.Get());
+  command_list->SetComputeRoot32BitConstants(0, sizeof(copy) / sizeof(u32), &copy, 0);
+  command_list->SetComputeRootDescriptorTable(1, GpuDescriptor(kSlotDepthSRV));
+  command_list->SetComputeRootDescriptorTable(2, GpuDescriptor(kSlotMotionCopyEdramUAV));
+  command_list->Dispatch((copy.size[0] + 7) / 8, (copy.size[1] + 7) / 8, 1);
+  D3D12_RESOURCE_BARRIER uav[2] = {};
+  uav[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  uav[0].UAV.pResource = edram;
+  uav[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  uav[1].UAV.pResource = scene_motion_.Get();
+  command_list->ResourceBarrier(2, uav);
+}
+
 void DlssPass::ScaleColor(ID3D12GraphicsCommandList* command_list, u32 source_slot, u32 x, u32 y,
                           u32 dest_uav_slot, u32 width, u32 height, f32 scale) {
   struct {
@@ -684,6 +760,83 @@ bool DlssPass::EnsureStatsBuffers() {
   uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
   device_->CreateUnorderedAccessView(stats_.Get(), nullptr, &uav, CpuDescriptor(kSlotStatsUAV));
   return true;
+}
+
+bool DlssPass::EnsureMotionStatsBuffers() {
+  if (motion_stats_) {
+    return true;
+  }
+  auto create = [&](const D3D12_HEAP_PROPERTIES& heap, D3D12_RESOURCE_FLAGS flags,
+                    D3D12_RESOURCE_STATES state, u64 size,
+                    Microsoft::WRL::ComPtr<ID3D12Resource>& out) {
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = flags;
+    return SUCCEEDED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state,
+                                                      nullptr, IID_PPV_ARGS(&out)));
+  };
+  if (!create(objects::kHeapPropertiesDefault, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kMotionStatsBytes, motion_stats_) ||
+      !create(objects::kHeapPropertiesUpload, D3D12_RESOURCE_FLAG_NONE,
+              D3D12_RESOURCE_STATE_GENERIC_READ, kMotionStatsBytes, motion_stats_zero_) ||
+      !create(objects::kHeapPropertiesReadback, D3D12_RESOURCE_FLAG_NONE,
+              D3D12_RESOURCE_STATE_COPY_DEST, kMotionStatsBytes * kStatsSlots,
+              motion_stats_readback_)) {
+    motion_stats_.Reset();
+    return false;
+  }
+  void* zero = nullptr;
+  if (SUCCEEDED(motion_stats_zero_->Map(0, nullptr, &zero))) {
+    std::memset(zero, 0, kMotionStatsBytes);
+    motion_stats_zero_->Unmap(0, nullptr);
+  }
+  return true;
+}
+
+void DlssPass::RecordMotionStats(ID3D12GraphicsCommandList* command_list) {
+  // Read a slot written kStatsSlots - 1 frames ago (long done on the GPU), about once a second.
+  const u32 slot = static_cast<u32>(motion_stats_frame_ % kStatsSlots);
+  if (motion_stats_frame_ >= kStatsSlots && motion_stats_frame_ % 60 == 0) {
+    const u32 old_slot = static_cast<u32>((motion_stats_frame_ + 1) % kStatsSlots);
+    const D3D12_RANGE range = {old_slot * kMotionStatsBytes, (old_slot + 1) * kMotionStatsBytes};
+    void* mapped = nullptr;
+    if (SUCCEEDED(motion_stats_readback_->Map(0, &range, &mapped))) {
+      const u32* v = reinterpret_cast<const u32*>(static_cast<const u8*>(mapped) +
+                                                  old_slot * kMotionStatsBytes);
+      auto mean = [](u32 sum, u32 count) { return count ? sum / (4.0 * count) : 0.0; };
+      REXGPU_INFO("DLSS motion: {} pixels with object motion, mean {:.2f} px (camera motion "
+                  "there {:.2f} px, difference {:.2f} px); {} pixels with camera motion, mean "
+                  "{:.2f} px",
+                  v[0], mean(v[1], v[0]), mean(v[2], v[0]), mean(v[5], v[0]), v[3],
+                  mean(v[4], v[3]));
+      const D3D12_RANGE none = {0, 0};
+      motion_stats_readback_->Unmap(0, &none);
+    }
+  }
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = motion_stats_.Get();
+  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  command_list->ResourceBarrier(1, &barrier);
+  command_list->CopyBufferRegion(motion_stats_readback_.Get(), slot * kMotionStatsBytes,
+                                 motion_stats_.Get(), 0, kMotionStatsBytes);
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+  command_list->ResourceBarrier(1, &barrier);
+  command_list->CopyBufferRegion(motion_stats_.Get(), 0, motion_stats_zero_.Get(), 0,
+                                 kMotionStatsBytes);
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  command_list->ResourceBarrier(1, &barrier);
+  ++motion_stats_frame_;
 }
 
 void DlssPass::RecordStats(ID3D12GraphicsCommandList* command_list, u32 pixels) {
@@ -1172,11 +1325,25 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
   srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   srv.Texture2D.MipLevels = 1;
   device_->CreateShaderResourceView(inputs.depth, &srv, CpuDescriptor(kSlotDepthSRV));
+  // The object motion, or a null view when there is none this frame.
+  const bool object_motion = inputs.object_motion && scene_motion_ &&
+                             scene_motion_width_ >= inputs.depth_x + inputs.render_width &&
+                             scene_motion_height_ >= inputs.depth_y + inputs.render_height;
+  D3D12_SHADER_RESOURCE_VIEW_DESC motion_srv = {};
+  motion_srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+  motion_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  motion_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  motion_srv.Texture2D.MipLevels = 1;
+  device_->CreateShaderResourceView(object_motion ? scene_motion_.Get() : nullptr, &motion_srv,
+                                    CpuDescriptor(kSlotObjectMotionSRV));
   srv.Format = color_format;
   device_->CreateShaderResourceView(inputs.color, &srv, CpuDescriptor(kSlotSceneSRV));
 
   Barriers barriers;
   barriers.Add(inputs.depth, inputs.depth_state, kShaderRead);
+  if (object_motion) {
+    barriers.Add(scene_motion_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kShaderRead);
+  }
   barriers.Add(inputs.color, inputs.color_state, kShaderRead);
   barriers.Submit(command_list);
 
@@ -1187,6 +1354,7 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
   constants.depth_origin[1] = inputs.depth_y;
   constants.size[0] = inputs.render_width;
   constants.size[1] = inputs.render_height;
+  constants.object_motion_valid = object_motion ? 1 : 0;
   ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
   command_list->SetDescriptorHeaps(1, heaps);
   command_list->SetComputeRootSignature(root_signature_.Get());
@@ -1419,6 +1587,42 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
       current_x = current_y = 0;
     }
   }
+  if (inputs.debug_motion && !failed_ && EnsureMotionStatsBuffers()) {
+    // The motion vectors in place of the scene, at the render size, from the depth and object
+    // motion still bound for the inputs.
+    device_->CreateUnorderedAccessView(color_out_.Get(), nullptr, nullptr,
+                                       CpuDescriptor(kSlotDebugOutUAV));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC stats_uav = {};
+    stats_uav.Format = DXGI_FORMAT_R32_TYPELESS;
+    stats_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    stats_uav.Buffer.NumElements = kMotionStatsBytes / 4;
+    stats_uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    device_->CreateUnorderedAccessView(motion_stats_.Get(), nullptr, &stats_uav,
+                                       CpuDescriptor(kSlotDebugStatsUAV));
+    if (color_out_read) {
+      barriers.Add(color_out_.Get(), kShaderRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      barriers.Submit(command_list);
+    }
+    ID3D12DescriptorHeap* debug_heaps[] = {heap_.Get()};
+    command_list->SetDescriptorHeaps(1, debug_heaps);
+    command_list->SetComputeRootSignature(root_signature_.Get());
+    command_list->SetPipelineState(motion_debug_pipeline_.Get());
+    command_list->SetComputeRoot32BitConstants(0, sizeof(constants) / sizeof(u32), &constants, 0);
+    command_list->SetComputeRootDescriptorTable(1, GpuDescriptor(kSlotDepthSRV));
+    command_list->SetComputeRootDescriptorTable(2, GpuDescriptor(kSlotDebugOutUAV));
+    command_list->Dispatch((inputs.render_width + 7) / 8, (inputs.render_height + 7) / 8, 1);
+    barriers.Add(color_out_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kShaderRead);
+    barriers.Submit(command_list);
+    D3D12_RESOURCE_BARRIER stats_barrier = {};
+    stats_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    stats_barrier.UAV.pResource = motion_stats_.Get();
+    command_list->ResourceBarrier(1, &stats_barrier);
+    RecordMotionStats(command_list);
+    color_out_read = true;
+    current = color_out_.Get();
+    current_slot = kSlotColorOutSRV;
+    current_x = current_y = 0;
+  }
   if (run_nr && !nr_before && !failed_) {
     run_nr_step(inputs.width, inputs.height);
   }
@@ -1495,6 +1699,9 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
     barriers.Add(scene_ldr_.Get(), kShaderRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   }
   barriers.Add(inputs.depth, kShaderRead, inputs.depth_state);
+  if (object_motion) {
+    barriers.Add(scene_motion_.Get(), kShaderRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
   barriers.Submit(command_list);
 #else
   (void)command_list;

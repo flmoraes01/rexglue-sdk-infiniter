@@ -2339,6 +2339,9 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
     return false;
   }
   NoteDlssDraw(*vertex_shader);
+  NoteDlssMotionDraw(*vertex_shader, pixel_shader, primitive_processing_result, memexport_used,
+                     normalized_depth_control, vertex_shader_modification,
+                     pixel_shader_modification);
 
   // Translation precedes the pipeline, which needs the used textures and render target formats.
   D3D12Shader::D3D12Translation* vertex_shader_translation =
@@ -2421,6 +2424,10 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
 
   draw_state::Scissor scissor;
   draw_state::GetScissor(regs, scissor);
+  if (dlss_motion_draw_) {
+    dlss_motion_viewport_[0] = viewport_info.xy_extent[0];
+    dlss_motion_viewport_[1] = viewport_info.xy_extent[1];
+  }
   scissor.offset[0] *= draw_resolution_scale_x;
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;
@@ -3504,6 +3511,75 @@ bool D3D12CommandProcessor::IsDlssCameraShader(u64 ucode_hash) {
          dlss_camera_shaders_.end();
 }
 
+void D3D12CommandProcessor::NoteDlssMotionDraw(
+    const Shader& vertex_shader, const Shader* pixel_shader,
+    const PrimitiveProcessor::ProcessingResult& primitive_processing_result, bool memexport_used,
+    xenos::reg::RB_DEPTHCONTROL normalized_depth_control,
+    DXBCShaderTranslator::Modification& vertex_shader_modification,
+    DXBCShaderTranslator::Modification& pixel_shader_modification) {
+  dlss_motion_draw_ = false;
+  dlss_motion_valid_ = false;
+  dlss_motion_previous_constants_ = nullptr;
+  // Projected scene triangles with a pixel shader; the depth test decides which surface's motion a
+  // pixel keeps. Draws that do not write depth (after a depth prepass) write it only when opaque,
+  // so a blended surface does not take the motion of what is behind it.
+  const xenos::RegisterFile& regs = *register_file_;
+  const xenos::PrimitiveType primitive_type = primitive_processing_result.host_primitive_type;
+  const auto blend = regs.Get<xenos::reg::RB_BLENDCONTROL>(
+      xenos::reg::RB_BLENDCONTROL::kRTRegisterIndices[0]);
+  const bool opaque = blend.color_srcblend == xenos::BlendFactor::kOne &&
+                      blend.color_destblend == xenos::BlendFactor::kZero &&
+                      blend.color_comb_fcn == xenos::BlendOp::kAdd;
+  if (!dlss_jitter_draw_ || !pixel_shader || memexport_used ||
+      !GetD3D12Settings().dlss_object_motion.Get() ||
+      render_target_cache_->GetPath() != RenderTargetCache::Path::kPixelShaderInterlock ||
+      primitive_processing_result.host_vertex_shader_type != Shader::HostVertexShaderType::kVertex ||
+      (primitive_type != xenos::PrimitiveType::kTriangleList &&
+       primitive_type != xenos::PrimitiveType::kTriangleStrip) ||
+      !normalized_depth_control.z_enable ||
+      (!normalized_depth_control.z_write_enable && !opaque)) {
+    return;
+  }
+  vertex_shader_modification.vertex.motion_vectors = 1;
+  pixel_shader_modification.pixel.motion_vectors = 1;
+  dlss_motion_draw_ = true;
+
+  // This draw's packed vertex float constants, and the same draw's in the previous frame: the
+  // same shader and vertex buffer, the same order among those.
+  const Shader::ConstantRegisterMap& constant_map = vertex_shader.GetConstantRegisterMap();
+  dlss_motion_current_constants_.resize(size_t{constant_map.float_count} * 4);
+  u32* constants = dlss_motion_current_constants_.data();
+  for (u32 i = 0; i < 4; ++i) {
+    u64 bits = constant_map.float_bitmap[i];
+    u32 index;
+    while (rex::bit_scan_forward(bits, &index)) {
+      bits &= ~(u64{1} << index);
+      std::memcpy(constants,
+                  &regs[std::to_underlying(xenos::Register::SHADER_CONSTANT_000_X) + (i << 8) +
+                        (index << 2)],
+                  4 * sizeof(u32));
+      constants += 4;
+    }
+  }
+  u32 vertex_buffer_address = 0;
+  for (u32 i = 0; i < 3 && !vertex_buffer_address; ++i) {
+    u32 bits = constant_map.vertex_fetch_bitmap[i];
+    u32 index;
+    if (rex::bit_scan_forward(bits, &index)) {
+      vertex_buffer_address = regs.GetVertexFetch(i * 32 + index).address;
+    }
+  }
+  const u64 base = vertex_shader.GetUcodeDataHash() * 31 + vertex_buffer_address;
+  const u64 key = base * 131 + dlss_motion_occurrences_[base]++;
+  dlss_motion_constants_[dlss_motion_frame_][key] = dlss_motion_current_constants_;
+  const auto& previous = dlss_motion_constants_[dlss_motion_frame_ ^ 1];
+  if (auto it = previous.find(key);
+      it != previous.end() && it->second.size() == dlss_motion_current_constants_.size()) {
+    dlss_motion_previous_constants_ = &it->second;
+    dlss_motion_valid_ = true;
+  }
+}
+
 void D3D12CommandProcessor::NoteDlssDraw(const Shader& vertex_shader) {
   dlss_jitter_draw_ = false;
   dlss_shrink_draw_ = false;
@@ -3654,10 +3730,81 @@ void D3D12CommandProcessor::RunDlssOnSceneTexture(ID3D12Resource* color,
   inputs.width = width;
   inputs.height = height;
   inputs.color_scale = dlss_scene_color_scale_;
+  inputs.object_motion = dlss_motion_copies_ != 0;
+  inputs.debug_motion = GetD3D12Settings().dlss_debug_view.Get() == "motion";
   RecordDlssCall(std::move(call));
 }
 
+void D3D12CommandProcessor::CopyDlssSceneMotion(const draw_state::ResolveRequest& resolve_info) {
+  const DlssSceneTextureSpec& spec = GetDlssSceneTextureSpec();
+  if (!spec.valid || !resolve_info.IsCopyingDepth() || !dlss_scene_depth_address_ ||
+      !dlss_motion_viewport_[0] || !dlss_motion_viewport_[1] ||
+      static_cast<u32>(resolve_info.copy_dest_info.copy_dest_format) != spec.depth_format ||
+      resolve_info.height_div_8 * 8 != spec.height || !GetD3D12Settings().dlss_object_motion.Get() ||
+      render_target_cache_->GetPath() != RenderTargetCache::Path::kPixelShaderInterlock ||
+      !IsDlssActive() || resolve_info.copy_dest_base < dlss_scene_depth_address_) {
+    return;
+  }
+  // Where the resolve lands in the scene depth texture: the 32x32 tile its base address starts,
+  // plus the offset within it.
+  const u32 pitch = resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32;
+  const u32 offset = resolve_info.copy_dest_base - dlss_scene_depth_address_;
+  u32 dest_x = UINT32_MAX, dest_y = UINT32_MAX;
+  for (u32 y = 0; y < spec.height && dest_x == UINT32_MAX; y += xenos::kTextureTileWidthHeight) {
+    for (u32 x = 0; x < spec.width; x += xenos::kTextureTileWidthHeight) {
+      if (xenos::GetTiledAddressLowerBound2D(x, y, pitch, 2) == offset) {
+        dest_x = x + resolve_info.copy_dest_coordinate_info.offset_x_div_8 * 8;
+        dest_y = y + resolve_info.copy_dest_coordinate_info.offset_y_div_8 * 8;
+        break;
+      }
+    }
+  }
+  const u32 width = resolve_info.coordinate_info.width_div_8 * 8;
+  const u32 height = resolve_info.height_div_8 * 8;
+  if (dest_x == UINT32_MAX || dest_x + width > spec.width || dest_y + height > spec.height) {
+    return;
+  }
+  const u32 scale_x = render_target_cache_->GetDrawResolutionScaleX();
+  const u32 scale_y = render_target_cache_->GetDrawResolutionScaleY();
+  const draw_state::ResolveEDRAMLayout& edram = resolve_info.depth_edram_info;
+  auto call = std::make_unique<DlssMotionCopyCall>();
+  call->processor = this;
+  DlssPass::MotionCopy& copy = call->copy;
+  copy.base_tiles = edram.base_tiles;
+  copy.pitch_tiles = edram.pitch_tiles;
+  copy.sample_count_log2[0] = edram.msaa_samples >= xenos::MSAASamples::k4X ? 1 : 0;
+  copy.sample_count_log2[1] = edram.msaa_samples >= xenos::MSAASamples::k2X ? 1 : 0;
+  copy.tile_size[0] = xenos::kEDRAMTileWidthSamples * scale_x;
+  copy.tile_size[1] = xenos::kEDRAMTileHeightSamples * scale_y;
+  copy.source_origin[0] = resolve_info.coordinate_info.edram_offset_x_div_8 * 8 * scale_x;
+  copy.source_origin[1] = resolve_info.coordinate_info.edram_offset_y_div_8 * 8 * scale_y;
+  copy.size[0] = width * scale_x;
+  copy.size[1] = height * scale_y;
+  copy.dest_origin[0] = dest_x * scale_x;
+  copy.dest_origin[1] = dest_y * scale_y;
+  copy.ndc_to_pixels[0] = 0.5f * static_cast<f32>(dlss_motion_viewport_[0]);
+  copy.ndc_to_pixels[1] = -0.5f * static_cast<f32>(dlss_motion_viewport_[1]);
+  copy.motion_region = copy.tile_size[0] * copy.tile_size[1] * xenos::kEDRAMTileCount;
+  call->edram_size_bytes = copy.motion_region * 2 * sizeof(u32);
+  call->scene_width = spec.width * scale_x;
+  call->scene_height = spec.height * scale_y;
+  call->edram = render_target_cache_->BeginEDRAMHostAccess();
+  SubmitBarriers();
+  deferred_command_list_.HostCall(&DlssMotionCopyHostCall, call.get());
+  dlss_motion_copy_calls_.push_back(std::move(call));
+  InvalidateCommandListState();
+  ++dlss_motion_copies_;
+}
+
+void D3D12CommandProcessor::DlssMotionCopyHostCall(void* user,
+                                                   ID3D12GraphicsCommandList* command_list) {
+  auto& call = *static_cast<DlssMotionCopyCall*>(user);
+  call.processor->dlss_pass_.CopySceneMotion(command_list, call.edram, call.edram_size_bytes,
+                                             call.copy, call.scene_width, call.scene_height);
+}
+
 void D3D12CommandProcessor::RunDlssBeforeResolve(const draw_state::ResolveRequest& resolve_info) {
+  CopyDlssSceneMotion(resolve_info);
   if (const DlssSceneTextureSpec& spec = GetDlssSceneTextureSpec();
       spec.valid && !resolve_info.IsCopyingDepth() &&
       static_cast<u32>(resolve_info.copy_dest_info.copy_dest_format) == spec.color_format &&
@@ -3934,6 +4081,11 @@ void D3D12CommandProcessor::EndDlssFrame(u32 frontbuffer_width, u32 frontbuffer_
   }
   dlss_texture_scene_draws_ = 0;
   dlss_texture_jittered_draws_ = 0;
+  // Object motion: this frame's constants become the previous ones.
+  dlss_motion_copies_ = 0;
+  dlss_motion_frame_ ^= 1;
+  dlss_motion_constants_[dlss_motion_frame_].clear();
+  dlss_motion_occurrences_.clear();
   if (dlss_scene_done_) {
     dlss_previous_view_projection_ = dlss_view_projection_;
     dlss_previous_view_projection_valid_ = dlss_view_projection_valid_;
@@ -4035,6 +4187,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
     deferred_command_list_.Reset();
     dlss_calls_.clear();
+    dlss_motion_copy_calls_.clear();
 
     ff_viewport_update_needed_ = true;
     ff_scissor_update_needed_ = true;
@@ -4444,6 +4597,9 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
       flags |= DXBCShaderTranslator::kSysFlagROVDepthStencilEarlyWrite;
     }
   }
+  if (dlss_motion_valid_) {
+    flags |= DXBCShaderTranslator::kSysFlagMotionValid;
+  }
   dirty |= system_constants_.flags != flags;
   system_constants_.flags = flags;
 
@@ -4818,11 +4974,17 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     cbuffer_binding_system_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_system_constants);
   }
+  if (dlss_motion_draw_) {
+    // The previous constants follow the current ones, and differ per draw.
+    cbuffer_binding_float_vertex_.up_to_date = false;
+  }
   if (!cbuffer_binding_float_vertex_.up_to_date) {
     // A valid binding is required even without float constants, so allocate an empty buffer.
+    const u32 float_constant_buffer_count =
+        float_constant_count_vertex * (dlss_motion_draw_ ? 2 : 1);
     u8* float_constants = constant_buffer_pool_->Request(
         frame_current_,
-        sizeof(f32) * 4 * std::max(float_constant_count_vertex, static_cast<u32>(1)),
+        sizeof(f32) * 4 * std::max(float_constant_buffer_count, static_cast<u32>(1)),
         D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
         &cbuffer_binding_float_vertex_.address);
     if (float_constants == nullptr) {
@@ -4839,6 +5001,12 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
                     4 * sizeof(f32));
         float_constants += 4 * sizeof(f32);
       }
+    }
+    if (dlss_motion_draw_ && float_constant_count_vertex) {
+      const std::vector<u32>& previous = dlss_motion_previous_constants_
+                                             ? *dlss_motion_previous_constants_
+                                             : dlss_motion_current_constants_;
+      std::memcpy(float_constants, previous.data(), sizeof(f32) * 4 * float_constant_count_vertex);
     }
     cbuffer_binding_float_vertex_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_float_constants_vertex);

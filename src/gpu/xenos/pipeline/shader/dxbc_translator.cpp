@@ -103,7 +103,12 @@ void DXBCShaderTranslator::Reset() {
 
   system_constants_used_ = 0;
 
+  system_temp_motion_previous_position_ = UINT32_MAX;
+  float_constant_pass_offset_ = 0;
+
   out_reg_vs_interpolators_ = UINT32_MAX;
+  out_reg_vs_motion_ = UINT32_MAX;
+  in_reg_ps_motion_ = UINT32_MAX;
   out_reg_vs_position_ = UINT32_MAX;
   out_reg_vs_clip_cull_distances_ = UINT32_MAX;
   out_reg_vs_point_size_ = UINT32_MAX;
@@ -599,6 +604,10 @@ void DXBCShaderTranslator::StartTranslation() {
       out_reg_vs_interpolators_ = out_reg_index;
       out_reg_index += interpolator_register_count;
     }
+    if (GetMotionRegisterCount()) {
+      out_reg_vs_motion_ = out_reg_index;
+      out_reg_index += GetMotionRegisterCount();
+    }
     out_reg_vs_position_ = out_reg_index;
     ++out_reg_index;
     u32 clip_and_cull_distance_count = shader_modification.GetVertexClipDistanceCount() +
@@ -617,6 +626,10 @@ void DXBCShaderTranslator::StartTranslation() {
       in_reg_ps_interpolators_ = in_reg_index;
       in_reg_index += interpolator_register_count;
     }
+    if (GetMotionRegisterCount()) {
+      in_reg_ps_motion_ = in_reg_index;
+      in_reg_index += GetMotionRegisterCount();
+    }
     if (shader_modification.pixel.param_gen_point) {
       in_reg_ps_point_coordinates_ = in_reg_index;
       ++in_reg_index;
@@ -630,6 +643,11 @@ void DXBCShaderTranslator::StartTranslation() {
   if (IsVertexShader()) {
     system_temp_position_ = PushSystemTemp(0b1111);
     system_temp_point_size_edge_flag_kill_vertex_ = PushSystemTemp(0b0100);
+    if (IsMotionVectorVertexShader()) {
+      // The first pass reads the previous constants, after the current ones.
+      system_temp_motion_previous_position_ = PushSystemTemp(0b1111);
+      float_constant_pass_offset_ = GetCurrentShader().GetConstantRegisterMap().float_count;
+    }
     // A negative point size makes the geometry shader use the default size.
     a_.OpMov(dxbc::Dest::R(system_temp_point_size_edge_flag_kill_vertex_, 0b0001),
              dxbc::Src::LF(-1.0f));
@@ -694,6 +712,10 @@ void DXBCShaderTranslator::StartTranslation() {
     return;
   }
 
+  OpenControlFlowLoop();
+}
+
+void DXBCShaderTranslator::OpenControlFlowLoop() {
   a_.OpLoop();
   if (IsSwitchControlFlowUsed()) {
     a_.OpSwitch(dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kYYYY));
@@ -703,7 +725,62 @@ void DXBCShaderTranslator::StartTranslation() {
   }
 }
 
-void DXBCShaderTranslator::CompleteVertexOrDomainShader() {
+void DXBCShaderTranslator::CloseControlFlowLoop() {
+  CloseExecConditionals();
+  if (IsSwitchControlFlowUsed()) {
+    a_.OpBreak();
+    a_.OpEndSwitch();
+  } else {
+    a_.OpEndIf();
+  }
+  a_.OpBreak();
+  a_.OpEndLoop();
+}
+
+u32 DXBCShaderTranslator::GetMotionRegisterCount() const {
+  const Modification modification = GetDXBCShaderModification();
+  if (IsVertexShader()) {
+    return modification.vertex.motion_vectors ? 2 : 0;
+  }
+  return IsPixelShader() && edram_rov_used_ && modification.pixel.motion_vectors &&
+                 !is_depth_only_pixel_shader_
+             ? 2
+             : 0;
+}
+
+bool DXBCShaderTranslator::IsMotionVectorVertexShader() const {
+  return IsVertexShader() && GetDXBCShaderModification().vertex.motion_vectors;
+}
+
+u32 DXBCShaderTranslator::GetFloatConstantBufferCount() const {
+  const u32 count = GetCurrentShader().GetConstantRegisterMap().float_count;
+  return IsMotionVectorVertexShader() ? count * 2 : count;
+}
+
+u32 DXBCShaderTranslator::GetTranslationPassCount() const {
+  return IsMotionVectorVertexShader() ? 2 : 1;
+}
+
+void DXBCShaderTranslator::StartTranslationPass([[maybe_unused]] u32 pass) {
+  // The pass with the previous constants is done: keep its position and run the shader again from
+  // the start with the current constants.
+  CloseControlFlowLoop();
+  a_.OpMov(dxbc::Dest::R(system_temp_motion_previous_position_),
+           dxbc::Src::R(system_temp_position_));
+  float_constant_pass_offset_ = 0;
+  a_.OpMov(dxbc::Dest::R(system_temp_position_), dxbc::Src::LF(0.0f));
+  a_.OpMov(dxbc::Dest::R(system_temp_point_size_edge_flag_kill_vertex_), dxbc::Src::LF(0.0f));
+  a_.OpMov(dxbc::Dest::R(system_temp_point_size_edge_flag_kill_vertex_, 0b0001),
+           dxbc::Src::LF(-1.0f));
+  for (u32 temp : {system_temp_ps_pc_p0_a0_, system_temp_al_, system_temp_loop_count_,
+                   system_temp_grad_h_lod_, system_temp_grad_v_vfetch_address_}) {
+    a_.OpMov(dxbc::Dest::R(temp), dxbc::Src::LU(0));
+  }
+  StartVertexOrDomainShader();
+  OpenControlFlowLoop();
+}
+
+void DXBCShaderTranslator::ApplyVertexPositionFormat(u32 position_temp) {
   u32 temp = PushSystemTemp();
   dxbc::Dest temp_x_dest(dxbc::Dest::R(temp, 0b0001));
   dxbc::Src temp_x_src(dxbc::Src::R(temp, dxbc::Src::kXXXX));
@@ -712,24 +789,43 @@ void DXBCShaderTranslator::CompleteVertexOrDomainShader() {
 
   a_.OpAnd(temp_x_dest, flags_src, dxbc::Src::LU(kSysFlagWNotReciprocal));
   a_.OpIf(false, temp_x_src);
-  a_.OpDiv(dxbc::Dest::R(system_temp_position_, 0b1000), dxbc::Src::LF(1.0f),
-           dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW));
+  a_.OpDiv(dxbc::Dest::R(position_temp, 0b1000), dxbc::Src::LF(1.0f),
+           dxbc::Src::R(position_temp, dxbc::Src::kWWWW));
   a_.OpEndIf();
 
   a_.OpAnd(temp_x_dest, flags_src, dxbc::Src::LU(kSysFlagXYDividedByW));
   a_.OpIf(true, temp_x_src);
-  a_.OpMul(dxbc::Dest::R(system_temp_position_, 0b0011), dxbc::Src::R(system_temp_position_),
-           dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW));
+  a_.OpMul(dxbc::Dest::R(position_temp, 0b0011), dxbc::Src::R(position_temp),
+           dxbc::Src::R(position_temp, dxbc::Src::kWWWW));
   a_.OpEndIf();
 
   a_.OpAnd(temp_x_dest, flags_src, dxbc::Src::LU(kSysFlagZDividedByW));
   a_.OpIf(true, temp_x_src);
-  a_.OpMul(dxbc::Dest::R(system_temp_position_, 0b0100),
-           dxbc::Src::R(system_temp_position_, dxbc::Src::kZZZZ),
-           dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW));
+  a_.OpMul(dxbc::Dest::R(position_temp, 0b0100), dxbc::Src::R(position_temp, dxbc::Src::kZZZZ),
+           dxbc::Src::R(position_temp, dxbc::Src::kWWWW));
   a_.OpEndIf();
 
+  PopSystemTemp();
+}
+
+void DXBCShaderTranslator::CompleteVertexOrDomainShader() {
+  ApplyVertexPositionFormat(system_temp_position_);
+
   Modification shader_modification = GetDXBCShaderModification();
+  if (shader_modification.vertex.motion_vectors) {
+    // Clip x, y and w of this frame and of the previous one, before the host viewport and the
+    // jitter, for the pixel shader to divide per pixel.
+    ApplyVertexPositionFormat(system_temp_motion_previous_position_);
+    a_.OpMov(dxbc::Dest::O(out_reg_vs_motion_, 0b0111),
+             dxbc::Src::R(system_temp_position_, 0b110100));
+    a_.OpMov(dxbc::Dest::O(out_reg_vs_motion_ + 1, 0b0111),
+             dxbc::Src::R(system_temp_motion_previous_position_, 0b110100));
+  }
+
+  u32 temp = PushSystemTemp();
+  dxbc::Dest temp_x_dest(dxbc::Dest::R(temp, 0b0001));
+  dxbc::Src temp_x_src(dxbc::Src::R(temp, dxbc::Src::kXXXX));
+
   u32 clip_distance_next_component = 0;
   u32 cull_distance_next_component = shader_modification.GetVertexClipDistanceCount();
 
@@ -795,15 +891,7 @@ void DXBCShaderTranslator::CompleteVertexOrDomainShader() {
 
 void DXBCShaderTranslator::CompleteShaderCode() {
   if (!is_depth_only_pixel_shader_) {
-    CloseExecConditionals();
-    if (IsSwitchControlFlowUsed()) {
-      a_.OpBreak();
-      a_.OpEndSwitch();
-    } else {
-      a_.OpEndIf();
-    }
-    a_.OpBreak();
-    a_.OpEndLoop();
+    CloseControlFlowLoop();
 
     PopSystemTemp(6);
   }
@@ -824,7 +912,7 @@ void DXBCShaderTranslator::CompleteShaderCode() {
   a_.OpRet();
 
   if (IsVertexShader()) {
-    PopSystemTemp(2);
+    PopSystemTemp(IsMotionVectorVertexShader() ? 3 : 2);
   } else if (IsPixelShader()) {
     u32 shader_writes_color_targets = GetCurrentShader().GetWritesColorTargets();
     for (i32 i = 3; i >= 0; --i) {
@@ -1084,9 +1172,10 @@ dxbc::Src DXBCShaderTranslator::LoadOperand(const InstructionOperand& operand,
         if (float_constant_index == UINT32_MAX) {
           return dxbc::Src::LF(0.0f);
         }
-        index.index = float_constant_index;
+        index.index = float_constant_index + float_constant_pass_offset_;
       } else {
         REX_ASSERT(constant_register_map.float_dynamic_addressing);
+        index.index += float_constant_pass_offset_;
       }
       src = dxbc::Src::CB(cbuffer_index_float_constants_,
                           std::to_underlying(CbufferRegister::kFloatConstants), index);
@@ -1659,7 +1748,7 @@ void DXBCShaderTranslator::WriteResourceDefinition() {
       switch (static_cast<ShaderRDEFTypeIndex>(i)) {
         case ShaderRDEFTypeIndex::kFloat4ConstantArray:
           type.element_count =
-              std::max(static_cast<u16>(constant_register_map.float_count), static_cast<u16>(1));
+              std::max(static_cast<u16>(GetFloatConstantBufferCount()), static_cast<u16>(1));
           break;
         case ShaderRDEFTypeIndex::kUint4DescriptorIndexArray:
           type.element_count = std::max(static_cast<u16>((GetBindlessResourceCount() + 3) >> 2),
@@ -1733,7 +1822,7 @@ void DXBCShaderTranslator::WriteResourceDefinition() {
     auto& constant_float = *reinterpret_cast<dxbc::RDEFVariable*>(shader_object_.data() +
                                                                   constant_position_dwords_float);
     constant_float.name_ptr = constant_name_ptr_float;
-    constant_float.size_bytes = sizeof(f32) * 4 * constant_register_map.float_count;
+    constant_float.size_bytes = sizeof(f32) * 4 * GetFloatConstantBufferCount();
     constant_float.flags = dxbc::kRdefVariableFlagUsed;
     constant_float.type_ptr =
         types_ptr +
@@ -1847,7 +1936,7 @@ void DXBCShaderTranslator::WriteResourceDefinition() {
         cbuffer.variable_count = 1;
         cbuffer.variables_ptr =
             (constant_position_dwords_float - blob_position_dwords) * sizeof(u32);
-        cbuffer.size_vector_aligned_bytes = sizeof(f32) * 4 * constant_register_map.float_count;
+        cbuffer.size_vector_aligned_bytes = sizeof(f32) * 4 * GetFloatConstantBufferCount();
       } else if (i == cbuffer_index_bool_loop_constants_) {
         cbuffer.name_ptr = cbuffer_name_ptr_bool_loop;
         cbuffer.variable_count = 2;
@@ -2153,7 +2242,8 @@ void DXBCShaderTranslator::WriteInputSignature() {
   } else if (IsPixelShader()) {
     size_t interpolator_position = shader_object_.size();
     u32 interpolator_mask = GetModificationInterpolatorMask();
-    u32 interpolator_count = rex::BitCount(interpolator_mask);
+    // The motion registers follow the interpolators, also as TEXCOORD.
+    u32 interpolator_count = rex::BitCount(interpolator_mask) + GetMotionRegisterCount();
     shader_object_.resize(shader_object_.size() + interpolator_count * kParameterDwords);
     parameter_count += interpolator_count;
     {
@@ -2171,6 +2261,14 @@ void DXBCShaderTranslator::WriteInputSignature() {
         interpolator.mask = 0b1111;
         interpolator.always_reads_mask = interpolator_index < GetRegisterCount() ? 0b1111 : 0b0000;
         ++used_interpolator_index;
+      }
+      for (u32 i = 0; i < GetMotionRegisterCount(); ++i) {
+        dxbc::SignatureParameter& motion = interpolators[used_interpolator_index + i];
+        motion.semantic_index = kMotionSemanticIndex + i;
+        motion.component_type = dxbc::SignatureRegisterComponentType::kFloat32;
+        motion.register_index = in_reg_ps_motion_ + i;
+        motion.mask = 0b0111;
+        motion.always_reads_mask = 0b0111;
       }
     }
 
@@ -2377,18 +2475,28 @@ void DXBCShaderTranslator::WriteOutputSignature() {
 
   if (IsVertexShader()) {
     size_t interpolator_position = shader_object_.size();
-    u32 interpolator_count = rex::BitCount(GetModificationInterpolatorMask());
+    const u32 guest_interpolator_count = rex::BitCount(GetModificationInterpolatorMask());
+    // The motion registers follow the interpolators, also as TEXCOORD.
+    u32 interpolator_count = guest_interpolator_count + GetMotionRegisterCount();
     shader_object_.resize(shader_object_.size() + interpolator_count * kParameterDwords);
     parameter_count += interpolator_count;
     {
       auto interpolators = reinterpret_cast<dxbc::SignatureParameter*>(shader_object_.data() +
                                                                        interpolator_position);
-      for (u32 i = 0; i < interpolator_count; ++i) {
+      for (u32 i = 0; i < guest_interpolator_count; ++i) {
         dxbc::SignatureParameter& interpolator = interpolators[i];
         interpolator.semantic_index = i;
         interpolator.component_type = dxbc::SignatureRegisterComponentType::kFloat32;
         interpolator.register_index = out_reg_vs_interpolators_ + i;
         interpolator.mask = 0b1111;
+      }
+      for (u32 i = 0; i < GetMotionRegisterCount(); ++i) {
+        dxbc::SignatureParameter& motion = interpolators[guest_interpolator_count + i];
+        motion.semantic_index = kMotionSemanticIndex + i;
+        motion.component_type = dxbc::SignatureRegisterComponentType::kFloat32;
+        motion.register_index = out_reg_vs_motion_ + i;
+        motion.mask = 0b0111;
+        motion.never_writes_mask = 0b1000;
       }
     }
 
@@ -2665,7 +2773,7 @@ void DXBCShaderTranslator::WriteShaderCode() {
     ao_.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::kDcl, cbuffer_index_float_constants_,
                                           std::to_underlying(CbufferRegister::kFloatConstants),
                                           std::to_underlying(CbufferRegister::kFloatConstants)),
-                            constant_register_map.float_count,
+                            GetFloatConstantBufferCount(),
                             constant_register_map.float_dynamic_addressing
                                 ? dxbc::ConstantBufferAccessPattern::kDynamicIndexed
                                 : dxbc::ConstantBufferAccessPattern::kImmediateIndexed);
@@ -2799,6 +2907,9 @@ void DXBCShaderTranslator::WriteShaderCode() {
     for (u32 i = 0; i < interpolator_count; ++i) {
       ao_.OpDclOutput(dxbc::Dest::O(out_reg_vs_interpolators_ + i));
     }
+    for (u32 i = 0; i < GetMotionRegisterCount(); ++i) {
+      ao_.OpDclOutput(dxbc::Dest::O(out_reg_vs_motion_ + i, 0b0111));
+    }
     ao_.OpDclOutputSIV(dxbc::Dest::O(out_reg_vs_position_), dxbc::SystemValueName::kPosition);
     u32 clip_distance_count = shader_modification.GetVertexClipDistanceCount();
     u32 cull_distance_count = shader_modification.GetVertexCullDistanceCount();
@@ -2841,6 +2952,10 @@ void DXBCShaderTranslator::WriteShaderCode() {
               : dxbc::InterpolationMode::kLinear,
           dxbc::Dest::V1D(interpolator_register_index));
       ++interpolator_register_index;
+    }
+    for (u32 i = 0; i < GetMotionRegisterCount(); ++i) {
+      ao_.OpDclInputPS(dxbc::InterpolationMode::kLinear,
+                       dxbc::Dest::V1D(in_reg_ps_motion_ + i, 0b0111));
     }
     if (in_reg_ps_point_coordinates_ != UINT32_MAX) {
       ao_.OpDclInputPS(dxbc::InterpolationMode::kLinear,

@@ -1,6 +1,7 @@
 // Builds the inputs DLSS needs from the guest scene: a float copy of the depth buffer and
-// camera motion vectors. Motion is reprojected from depth with a matrix that maps this frame's
-// clip space to the previous frame's, so it covers camera movement only.
+// motion vectors. Motion is reprojected from depth with a matrix that maps this frame's clip space
+// to the previous frame's (camera movement), except where the scene draws wrote their own motion
+// (moving objects, in xe_object_motion, NaN elsewhere).
 //
 // Build: fxc /nologo /T cs_5_1 /E main /O3 /Vn kDlssInputsCS
 //            /Fh bytecode/d3d12_5_1/dlss_inputs_cs.h dlss_inputs_cs.hlsl
@@ -13,9 +14,11 @@ cbuffer constants : register(b0) {
   float4 xe_reproject_row3;
   uint2 xe_depth_origin;  // where the scene starts in the depth render target, in pixels
   uint2 xe_size;          // scene size in pixels
+  uint xe_object_motion_valid;  // xe_object_motion was written this frame
 };
 
 Texture2D<float> xe_depth : register(t0);
+Texture2D<float2> xe_object_motion : register(t1);
 RWTexture2D<float> xe_depth_out : register(u0);
 RWTexture2D<float2> xe_motion_out : register(u1);
 
@@ -37,6 +40,13 @@ void main(uint3 id : SV_DispatchThreadID) {
     float2 previous_uv = float2(previous_ndc.x * 0.5 + 0.5, 0.5 - previous_ndc.y * 0.5);
     // DLSS wants motion from the current pixel to where it was, in pixels.
     motion = (previous_uv - uv) * float2(xe_size);
+  }
+  if (xe_object_motion_valid) {
+    float2 object_motion = xe_object_motion.Load(int3(xe_depth_origin + id.xy, 0));
+    // NaN where the camera motion applies (finite, tested by bits: fxc folds x == x to true).
+    if (all((asuint(object_motion) & 0x7FFFFFFFu) < 0x7F800000u)) {
+      motion = object_motion;
+    }
   }
   xe_motion_out[id.xy] = motion;
 }

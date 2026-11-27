@@ -1079,7 +1079,12 @@ void DXBCShaderTranslator::CompletePixelShaderWriteToROV() {
 
   u32 tile_width = xenos::kEDRAMTileWidthSamples * draw_resolution_scale_x_;
 
+  // The motion of the first sample once its depth test is known, while the address is its own.
+  const bool write_motion = GetMotionRegisterCount() != 0;
   if (IsROVDepthStencilEarly()) {
+    if (write_motion) {
+      CompletePixelShaderWriteMotion();
+    }
     for (u32 i = 0; i < 4; ++i) {
       a_.OpAnd(temp_x_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
                dxbc::Src::LU(1 << (4 + i)));
@@ -1103,6 +1108,9 @@ void DXBCShaderTranslator::CompletePixelShaderWriteToROV() {
     }
   } else {
     ROVDepthStencilTest();
+    if (write_motion) {
+      CompletePixelShaderWriteMotion();
+    }
   }
 
   if (!is_depth_only_pixel_shader_) {
@@ -1477,6 +1485,51 @@ void DXBCShaderTranslator::CompletePixelShaderWriteToROV() {
   }
 
   PopSystemTemp();
+}
+
+void DXBCShaderTranslator::CompletePixelShaderWriteMotion() {
+  // system_temp_rov_params_.x bit 0 is the first sample passing, .y its depth address in dwords.
+  u32 temp = PushSystemTemp();
+  u32 ndc_temp = PushSystemTemp();
+  a_.OpAnd(dxbc::Dest::R(temp, 0b0001), dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
+           dxbc::Src::LU(1));
+  a_.OpIf(true, dxbc::Src::R(temp, dxbc::Src::kXXXX));
+  {
+    a_.OpMov(dxbc::Dest::R(temp, 0b0001), dxbc::Src::LU(UINT32_MAX));
+    a_.OpAnd(dxbc::Dest::R(temp, 0b0010), LoadFlagsSystemConstant(),
+             dxbc::Src::LU(kSysFlagMotionValid));
+    a_.OpIf(true, dxbc::Src::R(temp, dxbc::Src::kYYYY));
+    {
+      const u32 input = in_reg_ps_motion_;
+      // Current NDC in xy, previous in zw; the motion is previous minus current.
+      a_.OpDiv(dxbc::Dest::R(ndc_temp, 0b0011), dxbc::Src::V1D(input),
+               dxbc::Src::V1D(input, dxbc::Src::kZZZZ));
+      a_.OpDiv(dxbc::Dest::R(ndc_temp, 0b1100), dxbc::Src::V1D(input + 1, 0b01000100),
+               dxbc::Src::V1D(input + 1, dxbc::Src::kZZZZ));
+      a_.OpAdd(dxbc::Dest::R(ndc_temp, 0b0011), dxbc::Src::R(ndc_temp, 0b1110),
+               -dxbc::Src::R(ndc_temp));
+      a_.OpF32ToF16(dxbc::Dest::R(ndc_temp, 0b0011), dxbc::Src::R(ndc_temp));
+      a_.OpUMAd(dxbc::Dest::R(temp, 0b0001), dxbc::Src::R(ndc_temp, dxbc::Src::kYYYY),
+                dxbc::Src::LU(0x10000), dxbc::Src::R(ndc_temp, dxbc::Src::kXXXX));
+    }
+    a_.OpEndIf();
+    // Stored inverted, so zero (the initial and cleared value) means no motion.
+    a_.OpNot(dxbc::Dest::R(temp, 0b0001), dxbc::Src::R(temp, dxbc::Src::kXXXX));
+    // The motion region follows EDRAM, laid out like the depth buffer.
+    const u32 edram_size_32bpp_samples =
+        (xenos::kEDRAMTileHeightSamples * draw_resolution_scale_y_) *
+        (xenos::kEDRAMTileWidthSamples * draw_resolution_scale_x_) * xenos::kEDRAMTileCount;
+    a_.OpIAdd(dxbc::Dest::R(temp, 0b0010), dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
+              dxbc::Src::LU(edram_size_32bpp_samples));
+    if (uav_index_edram_ == kBindingIndexUnallocated) {
+      uav_index_edram_ = uav_count_++;
+    }
+    a_.OpStoreUAVTyped(dxbc::Dest::U(uav_index_edram_, std::to_underlying(UAVRegister::kEDRAM)),
+                       dxbc::Src::R(temp, dxbc::Src::kYYYY), 1,
+                       dxbc::Src::R(temp, dxbc::Src::kXXXX));
+  }
+  a_.OpEndIf();
+  PopSystemTemp(2);
 }
 
 void DXBCShaderTranslator::CompletePixelShader() {
