@@ -20,6 +20,7 @@
 
 #include <imgui.h>
 
+#include <rex/hid/pad.h>
 #include <rex/utility.h>
 #include <rex/types.h>
 #include <rex/ui/ui_system.h>
@@ -39,12 +40,16 @@ class ImGuiHost final {
     // Runs after a dialog closed itself by returning false from Draw, which bypasses the
     // overlay registry, so state derived from the visible dialogs can be recomputed.
     MoveOnlyFunction<void()> dialog_closed;
+    // The pad that navigates the dialogs this frame, or false for none (the title has it).
+    MoveOnlyFunction<bool(rex::hid::PadState&)> read_pad;
   };
 
   explicit ImGuiHost(Hooks hooks);
   ~ImGuiHost();
 
   ImGuiIO& GetIO();
+  // Feeds the pad from Hooks::read_pad to ImGui's gamepad navigation.
+  void UpdatePad(ImGuiIO& io);
   ImGuiStyle& GetImGuiStyle();
   ImFontAtlas& GetFonts();
   const InputCapture& GetInputCapture() const { return capture_; }
@@ -65,6 +70,7 @@ class ImGuiHost final {
   bool NeedsContinuousPaint() const;
 
  private:
+  bool pad_held_ = false;  // the last pad state fed to ImGui had the pad
   void Initialize();
   void ClearInput();
   void OnKey(InputEvent& e, bool is_down);

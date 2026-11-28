@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <iterator>
@@ -368,6 +369,7 @@ ImDrawData* ImGuiHost::BuildFrame() {
   io.DisplaySize.x = static_cast<f32>(display_width_) / content_scale_;
   io.DisplaySize.y = static_cast<f32>(display_height_) / content_scale_;
 
+  UpdatePad(io);
   ImGui::NewFrame();
   capture_.Update(io);
 
@@ -398,6 +400,67 @@ ImDrawData* ImGuiHost::BuildFrame() {
   DetachIfLastDialogRemoved();
   changed_ = false;
   return draw_data;
+}
+
+void ImGuiHost::UpdatePad(ImGuiIO& io) {
+  rex::hid::PadState pad;
+  const bool has_pad = hooks_.read_pad && hooks_.read_pad(pad);
+  if (!has_pad) {
+    pad = {};
+  }
+  if (has_pad) {
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+  } else {
+    io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
+  }
+  if (!has_pad && !pad_held_) {
+    return;
+  }
+  // A release reaches ImGui once after the pad goes away, so no key stays held.
+  pad_held_ = has_pad;
+  struct Button {
+    ImGuiKey key;
+    u16 bit;
+  };
+  static constexpr Button kButtons[] = {
+      {ImGuiKey_GamepadFaceDown, rex::hid::kPadA},
+      {ImGuiKey_GamepadFaceRight, rex::hid::kPadB},
+      {ImGuiKey_GamepadFaceLeft, rex::hid::kPadX},
+      {ImGuiKey_GamepadFaceUp, rex::hid::kPadY},
+      {ImGuiKey_GamepadDpadUp, rex::hid::kPadDPadUp},
+      {ImGuiKey_GamepadDpadDown, rex::hid::kPadDPadDown},
+      {ImGuiKey_GamepadDpadLeft, rex::hid::kPadDPadLeft},
+      {ImGuiKey_GamepadDpadRight, rex::hid::kPadDPadRight},
+      {ImGuiKey_GamepadL1, rex::hid::kPadLeftShoulder},
+      {ImGuiKey_GamepadR1, rex::hid::kPadRightShoulder},
+      {ImGuiKey_GamepadStart, rex::hid::kPadStart},
+      {ImGuiKey_GamepadBack, rex::hid::kPadBack},
+      {ImGuiKey_GamepadL3, rex::hid::kPadLeftThumb},
+      {ImGuiKey_GamepadR3, rex::hid::kPadRightThumb},
+  };
+  // The left stick also moves the selection, like the D pad (ImGui only scrolls with it).
+  constexpr i16 kStickDpad = 16000;
+  u16 buttons = pad.buttons;
+  buttons |= pad.thumb_ly > kStickDpad ? rex::hid::kPadDPadUp : 0;
+  buttons |= pad.thumb_ly < -kStickDpad ? rex::hid::kPadDPadDown : 0;
+  buttons |= pad.thumb_lx < -kStickDpad ? rex::hid::kPadDPadLeft : 0;
+  buttons |= pad.thumb_lx > kStickDpad ? rex::hid::kPadDPadRight : 0;
+  for (const Button& button : kButtons) {
+    io.AddKeyEvent(button.key, (buttons & button.bit) != 0);
+  }
+  auto analog = [&io](ImGuiKey key, f32 value) {
+    const f32 v = std::clamp(value, 0.0f, 1.0f);
+    io.AddKeyAnalogEvent(key, v > 0.1f, v);
+  };
+  analog(ImGuiKey_GamepadL2, pad.left_trigger / 255.0f);
+  analog(ImGuiKey_GamepadR2, pad.right_trigger / 255.0f);
+  // And scrolls, past a deadzone.
+  auto stick = [](i16 value) { return (std::abs(static_cast<f32>(value)) - 8000.0f) / 24000.0f; };
+  analog(ImGuiKey_GamepadLStickLeft, pad.thumb_lx < 0 ? stick(pad.thumb_lx) : 0.0f);
+  analog(ImGuiKey_GamepadLStickRight, pad.thumb_lx > 0 ? stick(pad.thumb_lx) : 0.0f);
+  analog(ImGuiKey_GamepadLStickUp, pad.thumb_ly > 0 ? stick(pad.thumb_ly) : 0.0f);
+  analog(ImGuiKey_GamepadLStickDown, pad.thumb_ly < 0 ? stick(pad.thumb_ly) : 0.0f);
 }
 
 bool ImGuiHost::HandleEvent(UIEvent& event) {

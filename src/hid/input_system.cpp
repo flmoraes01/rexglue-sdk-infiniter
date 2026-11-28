@@ -385,6 +385,21 @@ Result<InputSystem::PadReading> InputSystem::GetState(u32 user) {
   return result;
 }
 
+Result<rex::hid::PadState> InputSystem::ReadPadForUI(u32 user) {
+  State& state = *state_;
+  std::vector<ConnectionEvent> events;
+  Result<rex::hid::PadState> result = std::unexpected(NotFound("input is not started"));
+  {
+    std::lock_guard lock(state.mutex);
+    if (state.started) {
+      state.RefreshDevicesLocked(events);
+      result = state.ReadRawLocked(user);
+    }
+  }
+  state.Fire(events);
+  return result;
+}
+
 Result<rex::hid::PadCapabilities> InputSystem::GetCapabilities(u32 user) {
   State& state = *state_;
   std::vector<ConnectionEvent> events;

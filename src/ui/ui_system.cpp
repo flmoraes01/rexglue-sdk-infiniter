@@ -244,6 +244,18 @@ void UISystem::State::CreateImGui() {
   hooks.set_clipboard = [this](std::string_view text) { driver->SetClipboardText(text); };
   // An exclusive overlay that closes itself (B or Esc) must release the pad block it holds.
   hooks.dialog_closed = [this] { SyncOverlayBlock(); };
+  // While an exclusive overlay holds the pad back from the title, the pad drives the overlay.
+  hooks.read_pad = [this](rex::hid::PadState& pad) {
+    if (!input || !overlays || !overlays->IsExclusiveVisible()) {
+      return false;
+    }
+    auto state = input->ReadPadForUI(0);
+    if (!state) {
+      return false;
+    }
+    pad = *state;
+    return true;
+  };
   imgui = std::make_unique<ui::ImGuiHost>(std::move(hooks));
   imgui->SetDialogCounter(&dialog_count);
   imgui->SetDisplay(window_width, window_height, content_scale);

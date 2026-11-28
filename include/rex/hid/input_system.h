@@ -73,6 +73,15 @@ REX_DECLARE_INTERFACE(IInputSystem, 2)
   [[nodiscard]] virtual Result<PadReading> GetState(u32 user) = 0;
 
   /**
+   * Reads a user's pad as held, ignoring the block an exclusive UI places on the title, for the
+   * UI's own navigation.
+   *
+   * @param user Slot 0 to 3.
+   * @return The state, or kNotFound when no pad is assigned to the user.
+   */
+  [[nodiscard]] virtual Result<PadState> ReadPadForUI(u32 user) = 0;
+
+  /**
    * Returns the capabilities of a user's pad, with the guide bit cleared when guide_button is off,
    * or kNotFound.
    *
