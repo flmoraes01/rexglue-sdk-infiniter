@@ -2433,6 +2433,21 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;
   scissor.extent[1] *= draw_resolution_scale_y;
+  if (dlss_shrink_draw_ && dlss_tiled_shrink_ && !dlss_tile_shrink_.empty()) {
+    // The scissor is squeezed like the geometry (rounded outwards): passes the title splits into
+    // strips by scissor keep their strips.
+    const f32 offset = DlssTileShrinkOffset();
+    const f32 left = dlss_tile_ratio_[0] * static_cast<f32>(scissor.offset[0]) + offset;
+    const f32 right =
+        dlss_tile_ratio_[0] * static_cast<f32>(scissor.offset[0] + scissor.extent[0]) + offset;
+    const f32 top = dlss_tile_ratio_[1] * static_cast<f32>(scissor.offset[1]);
+    const f32 bottom =
+        dlss_tile_ratio_[1] * static_cast<f32>(scissor.offset[1] + scissor.extent[1]);
+    scissor.offset[0] = static_cast<u32>(std::max(0.0f, std::floor(left)));
+    scissor.offset[1] = static_cast<u32>(std::max(0.0f, std::floor(top)));
+    scissor.extent[0] = static_cast<u32>(std::max(0.0f, std::ceil(right))) - scissor.offset[0];
+    scissor.extent[1] = static_cast<u32>(std::max(0.0f, std::ceil(bottom))) - scissor.offset[1];
+  }
 
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
 
@@ -3645,8 +3660,6 @@ void D3D12CommandProcessor::NoteDlssDraw(const Shader& vertex_shader) {
     // tile that read what an earlier one drew find it where they draw.
     dlss_shrink_draw_ = scene_draw && dlss_tiled_shrink_ && dlss_ran_last_frame_;
     if (scene_draw && depth_tested && projected) {
-      dlss_tile_pitch_recorded_ =
-          std::max(dlss_tile_pitch_recorded_, static_cast<u32>(surface_info.surface_pitch));
       dlss_tile_viewport_recorded_ = std::max(
           dlss_tile_viewport_recorded_,
           static_cast<u32>(2.0f * std::abs(regs.Get<f32>(xenos::Register::PA_CL_VPORT_XSCALE)) +
@@ -3759,6 +3772,13 @@ void D3D12CommandProcessor::RunDlssOnSceneTexture(ID3D12Resource* color,
   inputs.reactive_mask = GetD3D12Settings().dlss_reactive_mask.Get();
   inputs.debug_motion = GetD3D12Settings().dlss_debug_view.Get() == "motion";
   RecordDlssCall(std::move(call));
+}
+
+f32 D3D12CommandProcessor::DlssTileShrinkOffset() {
+  // The same for every target of the tile: scaling it by a target's pitch misplaced a pass by a
+  // fraction of a pixel and left a column of stale EDRAM in it.
+  return dlss_tile_shrink_[std::min<size_t>(dlss_tile_index_, dlss_tile_shrink_.size() - 1)]
+      .offset;
 }
 
 bool D3D12CommandProcessor::FindDlssSceneDest(const draw_state::ResolveRequest& resolve_info,
@@ -4173,8 +4193,6 @@ void D3D12CommandProcessor::EndDlssFrame(u32 frontbuffer_width, u32 frontbuffer_
   dlss_tile_index_ = 0;
   dlss_tile_viewport_ = dlss_tile_viewport_recorded_;
   dlss_tile_viewport_recorded_ = 0;
-  dlss_tile_pitch_ = dlss_tile_pitch_recorded_;
-  dlss_tile_pitch_recorded_ = 0;
   // Texture mode squeezes per tile: up to two tiles side by side, whose viewport is known.
   const bool texture_mode = !GetD3D12Settings().dlss_scene_texture.Get().empty();
   const DlssSceneTextureSpec& texture_spec = GetDlssSceneTextureSpec();
@@ -4766,18 +4784,12 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     // through the viewport (origin o, extent e), so draws with a fake viewport (positions already
     // in pixels) land the same: ndc' = r ndc + (r - 1) + 2 ((r - 1) o + c) / e, with y pointing up
     // and no c.
-    const DlssTileShrink& tile =
-        dlss_tile_shrink_[std::min<size_t>(dlss_tile_index_, dlss_tile_shrink_.size() - 1)];
     const f32 ratio_x = dlss_tile_ratio_[0], ratio_y = dlss_tile_ratio_[1];
+    const f32 offset = DlssTileShrinkOffset();
     const f32 origin_x = static_cast<f32>(viewport_info.xy_offset[0]);
     const f32 origin_y = static_cast<f32>(viewport_info.xy_offset[1]);
     const f32 extent_x = static_cast<f32>(viewport_info.xy_extent[0]);
     const f32 extent_y = static_cast<f32>(viewport_info.xy_extent[1]);
-    // Passes into a smaller target (half the scene's pitch) get the offset in their own pixels.
-    const u32 pitch = regs.Get<xenos::reg::RB_SURFACE_INFO>().surface_pitch;
-    const f32 offset = dlss_tile_pitch_ && pitch ? tile.offset * static_cast<f32>(pitch) /
-                                                       static_cast<f32>(dlss_tile_pitch_)
-                                                 : tile.offset;
     system_constants_.ndc_scale[0] *= ratio_x;
     system_constants_.ndc_scale[1] *= ratio_y;
     system_constants_.ndc_offset[0] =

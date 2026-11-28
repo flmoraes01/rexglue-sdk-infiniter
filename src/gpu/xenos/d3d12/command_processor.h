@@ -645,9 +645,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   // The projected scene draws' viewport width (guest pixels): this frame's, and the last frame's.
   u32 dlss_tile_viewport_recorded_ = 0;
   u32 dlss_tile_viewport_ = 0;
-  // Their render target pitch (pixels), the scale of the tile offsets: this frame's, the last's.
-  u32 dlss_tile_pitch_recorded_ = 0;
-  u32 dlss_tile_pitch_ = 0;
+  // The current draw's tile offset (host pixels). Needs dlss_tile_shrink_.
+  f32 DlssTileShrinkOffset();
   // Where a scene resolve lands in the scene texture at `base` (guest pixels), false if not in it.
   bool FindDlssSceneDest(const draw_state::ResolveRequest& resolve_info, u32 base, u32& x,
                          u32& y);
