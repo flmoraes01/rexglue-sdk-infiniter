@@ -9,6 +9,10 @@ cbuffer constants : register(b0) {
   uint2 xe_origin;  // where the source starts, in pixels
   uint2 xe_size;    // size to scale, in pixels
   float xe_scale;
+  // A tiled scene drawn smaller (see dlss_inputs_cs): from x = xe_tile_split on, the second
+  // tile's shift.
+  uint xe_tile_split;
+  uint2 xe_tile_shift;
 };
 
 Texture2D<float4> xe_source : register(t0);
@@ -19,5 +23,7 @@ void main(uint3 id : SV_DispatchThreadID) {
   if (any(id.xy >= xe_size)) {
     return;
   }
-  xe_dest[id.xy] = xe_source.Load(int3(xe_origin + id.xy, 0)) * xe_scale;
+  uint2 source = id.xy;
+  source.x += id.x < xe_tile_split ? xe_tile_shift.x : xe_tile_shift.y;
+  xe_dest[id.xy] = xe_source.Load(int3(xe_origin + source, 0)) * xe_scale;
 }

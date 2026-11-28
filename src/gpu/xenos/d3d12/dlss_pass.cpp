@@ -54,6 +54,8 @@ struct InputsConstants {
   u32 depth_origin[2];
   u32 size[2];
   u32 object_motion_valid;
+  u32 tile_split;
+  u32 tile_shift[2];
 };
 static_assert(sizeof(DlssPass::MotionCopy) <= sizeof(InputsConstants),
               "The motion copy constants share the root constants of the inputs");
@@ -699,12 +701,15 @@ void DlssPass::CopySceneMotion(ID3D12GraphicsCommandList* command_list, ID3D12Re
 }
 
 void DlssPass::ScaleColor(ID3D12GraphicsCommandList* command_list, u32 source_slot, u32 x, u32 y,
-                          u32 dest_uav_slot, u32 width, u32 height, f32 scale) {
+                          u32 dest_uav_slot, u32 width, u32 height, f32 scale, u32 tile_split,
+                          u32 tile_shift_0, u32 tile_shift_1) {
   struct {
     u32 origin[2];
     u32 size[2];
     f32 scale;
-  } constants = {{x, y}, {width, height}, scale};
+    u32 tile_split;
+    u32 tile_shift[2];
+  } constants = {{x, y}, {width, height}, scale, tile_split, {tile_shift_0, tile_shift_1}};
   ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
   command_list->SetDescriptorHeaps(1, heaps);
   command_list->SetComputeRootSignature(root_signature_.Get());
@@ -1430,6 +1435,9 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
   constants.size[0] = inputs.render_width;
   constants.size[1] = inputs.render_height;
   constants.object_motion_valid = object_motion ? 1 : 0;
+  constants.tile_split = inputs.tile_split;
+  constants.tile_shift[0] = inputs.tile_shift[0];
+  constants.tile_shift[1] = inputs.tile_shift[1];
   ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
   command_list->SetDescriptorHeaps(1, heaps);
   command_list->SetComputeRootSignature(root_signature_.Get());
@@ -1501,7 +1509,8 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
   bool scene_hdr_read = false;
   if (scaled) {
     ScaleColor(command_list, kSlotSceneSRV, current_x, current_y, kSlotSceneHdrUAV,
-               inputs.render_width, inputs.render_height, inputs.color_scale);
+               inputs.render_width, inputs.render_height, inputs.color_scale, inputs.tile_split,
+               inputs.tile_shift[0], inputs.tile_shift[1]);
     barriers.Add(scene_hdr_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kShaderRead);
     barriers.Submit(command_list);
     scene_hdr_read = true;

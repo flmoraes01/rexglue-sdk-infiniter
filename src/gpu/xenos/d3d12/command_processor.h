@@ -623,6 +623,34 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Super Resolution: scene draws are squeezed into the top-left render_ratio of the target.
   bool dlss_shrink_draw_ = false;
   f32 dlss_render_ratio_ = 1.0f;  // of the current frame
+  // Texture mode Super Resolution. The scene is drawn in tiles (predicated tiling), each resolved
+  // to its own columns of the scene texture; each tile is squeezed in its own EDRAM, and DLSS
+  // reads the parts back side by side. The tiles come from the scene depth resolves of the last
+  // frame.
+  struct DlssTile {
+    u32 dest_x = 0;   // where the resolve lands in the scene texture, guest pixels
+    u32 edram_x = 0;  // the first EDRAM column it copies, guest pixels
+    u32 width = 0;
+  };
+  std::vector<DlssTile> dlss_tiles_recorded_;  // this frame's
+  std::vector<DlssTile> dlss_tiles_;           // the last frame's, which this frame uses
+  u32 dlss_tile_index_ = 0;                    // tiles resolved so far this frame
+  struct DlssTileShrink {
+    f32 offset = 0.0f;  // added to the squeezed x, host pixels
+    u32 shift = 0;      // how far right of its render pixel a pixel lies in the scene texture
+  };
+  std::vector<DlssTileShrink> dlss_tile_shrink_;
+  bool dlss_tiled_shrink_ = false;  // this frame's scene draws are squeezed per tile
+  f32 dlss_tile_ratio_[2] = {1.0f, 1.0f};  // render size over scene size
+  // The projected scene draws' viewport width (guest pixels): this frame's, and the last frame's.
+  u32 dlss_tile_viewport_recorded_ = 0;
+  u32 dlss_tile_viewport_ = 0;
+  // Their render target pitch (pixels), the scale of the tile offsets: this frame's, the last's.
+  u32 dlss_tile_pitch_recorded_ = 0;
+  u32 dlss_tile_pitch_ = 0;
+  // Where a scene resolve lands in the scene texture at `base` (guest pixels), false if not in it.
+  bool FindDlssSceneDest(const draw_state::ResolveRequest& resolve_info, u32 base, u32& x,
+                         u32& y);
   u32 dlss_phase_count_ = 16;
   u32 dlss_frame_index_ = 0;
   f32 dlss_jitter_[2] = {};  // host pixels, +x right, +y down

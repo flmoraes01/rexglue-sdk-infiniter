@@ -15,6 +15,11 @@ cbuffer constants : register(b0) {
   uint2 xe_depth_origin;  // where the scene starts in the depth render target, in pixels
   uint2 xe_size;          // scene size in pixels
   uint xe_object_motion_valid;  // xe_object_motion was written this frame
+  // Super Resolution of a tiled scene: each tile was drawn smaller in its own part of the targets.
+  // Render pixels from x = xe_tile_split on come from the second tile; each tile's pixels are
+  // xe_tile_shift further right in the targets.
+  uint xe_tile_split;
+  uint2 xe_tile_shift;
 };
 
 Texture2D<float> xe_depth : register(t0);
@@ -27,7 +32,9 @@ void main(uint3 id : SV_DispatchThreadID) {
   if (any(id.xy >= xe_size)) {
     return;
   }
-  float depth = xe_depth.Load(int3(xe_depth_origin + id.xy, 0));
+  uint2 source = id.xy;
+  source.x += id.x < xe_tile_split ? xe_tile_shift.x : xe_tile_shift.y;
+  float depth = xe_depth.Load(int3(xe_depth_origin + source, 0));
   xe_depth_out[id.xy] = depth;
 
   float2 uv = (float2(id.xy) + 0.5) / float2(xe_size);
@@ -42,7 +49,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     motion = (previous_uv - uv) * float2(xe_size);
   }
   if (xe_object_motion_valid) {
-    float2 object_motion = xe_object_motion.Load(int3(xe_depth_origin + id.xy, 0));
+    float2 object_motion = xe_object_motion.Load(int3(xe_depth_origin + source, 0));
     // NaN where the camera motion applies (finite, tested by bits: fxc folds x == x to true).
     if (all((asuint(object_motion) & 0x7FFFFFFFu) < 0x7F800000u)) {
       motion = object_motion;

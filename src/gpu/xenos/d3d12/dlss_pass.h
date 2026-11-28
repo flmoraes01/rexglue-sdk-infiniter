@@ -57,6 +57,12 @@ class DlssPass {
     u32 height = 0;
     u32 render_width = 0;  // the part the scene was drawn into; equal to width for DLAA
     u32 render_height = 0;
+    // Super Resolution of a scene drawn in tiles (texture mode): each tile was drawn smaller in
+    // its own part of the targets. Render pixels from x = tile_split on belong to the second
+    // tile; each tile's pixels are tile_shift further right in colour, depth and object motion.
+    // Needs a scaled colour (color_scale != 1).
+    u32 tile_split = UINT32_MAX;
+    u32 tile_shift[2] = {};
     f32 jitter_x = 0.0f;  // sub-pixel offset the scene was drawn with, in pixels
     f32 jitter_y = 0.0f;
     std::array<f32, 16> reproject{};  // current clip -> previous clip, row vector, row-major
@@ -161,7 +167,8 @@ class DlssPass {
   bool EnsureTextures(const Inputs& inputs, DXGI_FORMAT chain_format, DXGI_FORMAT color_format);
   // width x height of the texture in `source_slot` at (x, y), times `scale`, into `dest_uav_slot`.
   void ScaleColor(ID3D12GraphicsCommandList* command_list, u32 source_slot, u32 x, u32 y,
-                  u32 dest_uav_slot, u32 width, u32 height, f32 scale);
+                  u32 dest_uav_slot, u32 width, u32 height, f32 scale,
+                  u32 tile_split = UINT32_MAX, u32 tile_shift_0 = 0, u32 tile_shift_1 = 0);
   bool InitializeSmaa();
   bool InitializeGi();
   void UploadSmaaTables(ID3D12GraphicsCommandList* command_list);

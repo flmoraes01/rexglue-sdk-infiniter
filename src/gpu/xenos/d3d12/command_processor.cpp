@@ -3641,6 +3641,17 @@ void D3D12CommandProcessor::NoteDlssDraw(const Shader& vertex_shader) {
     // Geometry given in screen pixels (no viewport transform) is not projected by the camera and
     // stays put: jittered, it leaves columns of stale data where its pieces meet.
     const bool projected = regs.Get<xenos::reg::PA_CL_VTE_CNTL>().vport_x_scale_ena;
+    // Super Resolution squeezes everything drawn into the scene's targets, so the passes of a
+    // tile that read what an earlier one drew find it where they draw.
+    dlss_shrink_draw_ = scene_draw && dlss_tiled_shrink_ && dlss_ran_last_frame_;
+    if (scene_draw && depth_tested && projected) {
+      dlss_tile_pitch_recorded_ =
+          std::max(dlss_tile_pitch_recorded_, static_cast<u32>(surface_info.surface_pitch));
+      dlss_tile_viewport_recorded_ = std::max(
+          dlss_tile_viewport_recorded_,
+          static_cast<u32>(2.0f * std::abs(regs.Get<f32>(xenos::Register::PA_CL_VPORT_XSCALE)) +
+                           0.5f));
+    }
     if (scene_draw && depth_tested) {
       dlss_scene_draw_ = true;
       dlss_jitter_draw_ = projected && GetD3D12Settings().dlss_jitter.Get() &&
@@ -3750,6 +3761,28 @@ void D3D12CommandProcessor::RunDlssOnSceneTexture(ID3D12Resource* color,
   RecordDlssCall(std::move(call));
 }
 
+bool D3D12CommandProcessor::FindDlssSceneDest(const draw_state::ResolveRequest& resolve_info,
+                                              u32 base, u32& x_out, u32& y_out) {
+  const DlssSceneTextureSpec& spec = GetDlssSceneTextureSpec();
+  if (!spec.valid || !base || resolve_info.copy_dest_base < base) {
+    return false;
+  }
+  // The 32x32 tile of the texture the resolve's base address starts, plus the offset within it.
+  const u32 pitch = resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32;
+  const u32 offset = resolve_info.copy_dest_base - base;
+  for (u32 y = 0; y < spec.height; y += xenos::kTextureTileWidthHeight) {
+    for (u32 x = 0; x < spec.width; x += xenos::kTextureTileWidthHeight) {
+      if (xenos::GetTiledAddressLowerBound2D(x, y, pitch, 2) == offset) {
+        x_out = x + resolve_info.copy_dest_coordinate_info.offset_x_div_8 * 8;
+        y_out = y + resolve_info.copy_dest_coordinate_info.offset_y_div_8 * 8;
+        return x_out + resolve_info.coordinate_info.width_div_8 * 8 <= spec.width &&
+               y_out + resolve_info.height_div_8 * 8 <= spec.height;
+      }
+    }
+  }
+  return false;
+}
+
 void D3D12CommandProcessor::CopyDlssSceneMotion(const draw_state::ResolveRequest& resolve_info) {
   const DlssSceneTextureSpec& spec = GetDlssSceneTextureSpec();
   if (!spec.valid || !resolve_info.IsCopyingDepth() || !dlss_scene_depth_address_ ||
@@ -3760,25 +3793,12 @@ void D3D12CommandProcessor::CopyDlssSceneMotion(const draw_state::ResolveRequest
       !IsDlssActive() || resolve_info.copy_dest_base < dlss_scene_depth_address_) {
     return;
   }
-  // Where the resolve lands in the scene depth texture: the 32x32 tile its base address starts,
-  // plus the offset within it.
-  const u32 pitch = resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32;
-  const u32 offset = resolve_info.copy_dest_base - dlss_scene_depth_address_;
-  u32 dest_x = UINT32_MAX, dest_y = UINT32_MAX;
-  for (u32 y = 0; y < spec.height && dest_x == UINT32_MAX; y += xenos::kTextureTileWidthHeight) {
-    for (u32 x = 0; x < spec.width; x += xenos::kTextureTileWidthHeight) {
-      if (xenos::GetTiledAddressLowerBound2D(x, y, pitch, 2) == offset) {
-        dest_x = x + resolve_info.copy_dest_coordinate_info.offset_x_div_8 * 8;
-        dest_y = y + resolve_info.copy_dest_coordinate_info.offset_y_div_8 * 8;
-        break;
-      }
-    }
+  u32 dest_x = 0, dest_y = 0;
+  if (!FindDlssSceneDest(resolve_info, dlss_scene_depth_address_, dest_x, dest_y)) {
+    return;
   }
   const u32 width = resolve_info.coordinate_info.width_div_8 * 8;
   const u32 height = resolve_info.height_div_8 * 8;
-  if (dest_x == UINT32_MAX || dest_x + width > spec.width || dest_y + height > spec.height) {
-    return;
-  }
   const u32 scale_x = render_target_cache_->GetDrawResolutionScaleX();
   const u32 scale_y = render_target_cache_->GetDrawResolutionScaleY();
   const draw_state::ResolveEDRAMLayout& edram = resolve_info.depth_edram_info;
@@ -3819,6 +3839,19 @@ void D3D12CommandProcessor::DlssMotionCopyHostCall(void* user,
 }
 
 void D3D12CommandProcessor::RunDlssBeforeResolve(const draw_state::ResolveRequest& resolve_info) {
+  if (const DlssSceneTextureSpec& spec = GetDlssSceneTextureSpec();
+      spec.valid && resolve_info.IsCopyingDepth() &&
+      static_cast<u32>(resolve_info.copy_dest_info.copy_dest_format) == spec.depth_format &&
+      resolve_info.height_div_8 * 8 == spec.height) {
+    // A scene tile ends: the draws after it belong to the next one.
+    u32 dest_x = 0, dest_y = 0;
+    if (FindDlssSceneDest(resolve_info, dlss_scene_depth_address_, dest_x, dest_y) && !dest_y) {
+      dlss_tiles_recorded_.push_back({dest_x,
+                                      u32(resolve_info.coordinate_info.edram_offset_x_div_8 * 8),
+                                      u32(resolve_info.coordinate_info.width_div_8 * 8)});
+    }
+    ++dlss_tile_index_;
+  }
   CopyDlssSceneMotion(resolve_info);
   if (const DlssSceneTextureSpec& spec = GetDlssSceneTextureSpec();
       spec.valid && !resolve_info.IsCopyingDepth() &&
@@ -3877,7 +3910,7 @@ void D3D12CommandProcessor::RecordDlssCall(std::unique_ptr<DlssCall> call) {
   inputs.gi_ao_strength = static_cast<f32>(settings.ssgi_ao_strength.Get());
   inputs.gi_radius = static_cast<f32>(settings.ssgi_radius.Get());
   inputs.quality = mode.quality;
-  if (!settings.dlss_scene_texture.Get().empty()) {
+  if (!settings.dlss_scene_texture.Get().empty() && dlss_render_ratio_ >= 1.0f) {
     inputs.quality = 5;  // NVSDK_NGX_PerfQuality_Value_DLAA
   }
   if (dlss_render_ratio_ < 1.0f) {
@@ -3887,6 +3920,18 @@ void D3D12CommandProcessor::RecordDlssCall(std::unique_ptr<DlssCall> call) {
     }
     inputs.render_width = DlssRenderSize(inputs.width, dlss_render_ratio_);
     inputs.render_height = DlssRenderSize(inputs.height, dlss_render_ratio_);
+    if (dlss_tiled_shrink_) {
+      // The tiles side by side: render pixels from tile_split on are the second tile's.
+      const u32 scale_x = render_target_cache_->GetDrawResolutionScaleX();
+      inputs.tile_shift[0] = dlss_tile_shrink_[0].shift;
+      if (dlss_tile_shrink_.size() > 1) {
+        inputs.tile_split = static_cast<u32>(std::ceil(
+            dlss_tile_ratio_[0] * static_cast<f32>(dlss_tiles_[1].dest_x * scale_x) - 0.5f));
+        inputs.tile_shift[1] = dlss_tile_shrink_[1].shift;
+      }
+      // The reactive mask is in the scene's layout, not the render image's.
+      inputs.reactive_mask = false;
+    }
   } else {
     inputs.render_width = inputs.width;
     inputs.render_height = inputs.height;
@@ -4121,9 +4166,50 @@ void D3D12CommandProcessor::EndDlssFrame(u32 frontbuffer_width, u32 frontbuffer_
   }
   // The next frame's mode. A mode change restarts DLSS from a full-size frame.
   // Without the chosen upscaler there is nothing to upscale with: the scene stays full size.
-  const f32 ratio = IsUpscalerSupported() && GetD3D12Settings().dlss_scene_texture.Get().empty()
+  dlss_tiles_ = std::move(dlss_tiles_recorded_);
+  dlss_tiles_recorded_.clear();
+  std::sort(dlss_tiles_.begin(), dlss_tiles_.end(),
+            [](const DlssTile& a, const DlssTile& b) { return a.dest_x < b.dest_x; });
+  dlss_tile_index_ = 0;
+  dlss_tile_viewport_ = dlss_tile_viewport_recorded_;
+  dlss_tile_viewport_recorded_ = 0;
+  dlss_tile_pitch_ = dlss_tile_pitch_recorded_;
+  dlss_tile_pitch_recorded_ = 0;
+  // Texture mode squeezes per tile: up to two tiles side by side, whose viewport is known.
+  const bool texture_mode = !GetD3D12Settings().dlss_scene_texture.Get().empty();
+  const DlssSceneTextureSpec& texture_spec = GetDlssSceneTextureSpec();
+  const bool tiles_known = texture_spec.valid && !dlss_tiles_.empty() && dlss_tiles_.size() <= 2 &&
+                           dlss_tile_viewport_ && dlss_scene_color_scale_ != 1.0f;
+  const f32 ratio = IsUpscalerSupported() && (!texture_mode || tiles_known)
                         ? GetDlssMode().ratio
                         : 1.0f;
+  dlss_tiled_shrink_ = false;
+  dlss_tile_shrink_.clear();
+  if (texture_mode && ratio < 1.0f && tiles_known) {
+    const u32 scale_x = render_target_cache_->GetDrawResolutionScaleX();
+    const u32 scale_y = render_target_cache_->GetDrawResolutionScaleY();
+    const u32 width = texture_spec.width * scale_x, height = texture_spec.height * scale_y;
+    dlss_tile_ratio_[0] =
+        static_cast<f32>(DlssRenderSize(width, ratio)) / static_cast<f32>(width);
+    dlss_tile_ratio_[1] =
+        static_cast<f32>(DlssRenderSize(height, ratio)) / static_cast<f32>(height);
+    const f64 r = dlss_tile_ratio_[0];
+    // A tile drawn at EDRAM column e (host pixels) is squeezed to e' = a + r (e - a) + d around
+    // an anchor a a few pixels into the columns it resolves, so all of them stay inside. Its
+    // pixel lands in the scene texture at r x + (1 - r)(origin + a) + d for its x in the whole
+    // scene: d < 0 makes that shift whole, so the tiles' pixels sit on one grid.
+    for (const DlssTile& tile : dlss_tiles_) {
+      const f64 origin = (static_cast<f64>(tile.dest_x) - tile.edram_x) * scale_x;
+      // (1 - r) times the anchor's margin covers |d| < 1.
+      const f64 anchor =
+          static_cast<f64>(tile.edram_x * scale_x) + std::ceil(1.0 / (1.0 - r)) + 1.0;
+      const f64 exact = (1.0 - r) * (origin + anchor);
+      const f64 shift = std::floor(exact);
+      dlss_tile_shrink_.push_back(
+          {static_cast<f32>(anchor * (1.0 - r) + (shift - exact)), static_cast<u32>(shift)});
+    }
+    dlss_tiled_shrink_ = true;
+  }
   const auto now = std::chrono::steady_clock::now();
   if (dlss_last_frame_time_.time_since_epoch().count()) {
     dlss_frame_time_ms_ = std::clamp(
@@ -4673,7 +4759,34 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     system_constants_.ndc_scale[i] = viewport_info.ndc_scale[i];
     system_constants_.ndc_offset[i] = viewport_info.ndc_offset[i];
   }
-  if (dlss_shrink_draw_ && viewport_info.xy_extent[0] && viewport_info.xy_extent[1]) {
+  if (dlss_shrink_draw_ && dlss_tiled_shrink_ && !dlss_tile_shrink_.empty() &&
+      viewport_info.xy_extent[0] && viewport_info.xy_extent[1]) {
+    // A tile of a tiled scene, in the render target's pixels: x' = r x + c, y' = r y. The tile's
+    // offset c puts its pixels on the grid of the whole render image (dlss_tile_shrink_). Worked
+    // through the viewport (origin o, extent e), so draws with a fake viewport (positions already
+    // in pixels) land the same: ndc' = r ndc + (r - 1) + 2 ((r - 1) o + c) / e, with y pointing up
+    // and no c.
+    const DlssTileShrink& tile =
+        dlss_tile_shrink_[std::min<size_t>(dlss_tile_index_, dlss_tile_shrink_.size() - 1)];
+    const f32 ratio_x = dlss_tile_ratio_[0], ratio_y = dlss_tile_ratio_[1];
+    const f32 origin_x = static_cast<f32>(viewport_info.xy_offset[0]);
+    const f32 origin_y = static_cast<f32>(viewport_info.xy_offset[1]);
+    const f32 extent_x = static_cast<f32>(viewport_info.xy_extent[0]);
+    const f32 extent_y = static_cast<f32>(viewport_info.xy_extent[1]);
+    // Passes into a smaller target (half the scene's pitch) get the offset in their own pixels.
+    const u32 pitch = regs.Get<xenos::reg::RB_SURFACE_INFO>().surface_pitch;
+    const f32 offset = dlss_tile_pitch_ && pitch ? tile.offset * static_cast<f32>(pitch) /
+                                                       static_cast<f32>(dlss_tile_pitch_)
+                                                 : tile.offset;
+    system_constants_.ndc_scale[0] *= ratio_x;
+    system_constants_.ndc_scale[1] *= ratio_y;
+    system_constants_.ndc_offset[0] =
+        system_constants_.ndc_offset[0] * ratio_x + (ratio_x - 1.0f) +
+        2.0f * ((ratio_x - 1.0f) * origin_x + offset) / extent_x;
+    system_constants_.ndc_offset[1] = system_constants_.ndc_offset[1] * ratio_y + (1.0f - ratio_y) -
+                                      2.0f * (ratio_y - 1.0f) * origin_y / extent_y;
+    dirty = true;
+  } else if (dlss_shrink_draw_ && viewport_info.xy_extent[0] && viewport_info.xy_extent[1]) {
     // NDC [-1, 1] lands on the top-left render_width x render_height of the viewport:
     // x' = r x + (r - 1) w, y' = r y + (1 - r) w (y points up).
     const f32 ratio_x =
