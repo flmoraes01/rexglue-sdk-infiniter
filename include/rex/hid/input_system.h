@@ -37,6 +37,10 @@ class REX_HID_API InputSettings final : public SettingOwner {
   REX_SETTING(bool, shared_pads, false, "Every pad feeds user 0", kStartupOnly);
   REX_SETTING(bool, vibration, true, "Allow vibration");
   REX_SETTING(bool, guide_button, false, "Pass the guide button to the title");
+  REX_SETTING(std::string, pad_remap, "",
+              "Controller buttons the title sees as others, comma separated FROM=TO pairs such as "
+              "A=B,B=A (A B X Y LB RB Back Start LS RS Up Down Left Right); the UI reads the pad "
+              "as held");
   REX_SETTING(f64, left_stick_deadzone, 0.0, "Left stick deadzone", Range{0.0, 1.0});
   REX_SETTING(f64, right_stick_deadzone, 0.0, "Right stick deadzone", Range{0.0, 1.0});
   REX_SETTING(bool, mnk_mode, false, "Keyboard and mouse act as a pad");

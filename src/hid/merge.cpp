@@ -10,6 +10,9 @@
  */
 
 #include <algorithm>
+#include <bit>
+#include <cctype>
+#include <string_view>
 #include <cmath>
 #include <cstdlib>
 
@@ -66,6 +69,74 @@ bool IsNeutral(const rex::hid::PadState& state) {
   }
   return !PastDeadzone(state.thumb_lx) && !PastDeadzone(state.thumb_ly) &&
          !PastDeadzone(state.thumb_rx) && !PastDeadzone(state.thumb_ry);
+}
+
+PadRemap ParsePadRemap(std::string_view text) {
+  struct Name {
+    std::string_view name;
+    u16 bit;
+  };
+  static constexpr Name kNames[] = {
+      {"A", rex::hid::kPadA},
+      {"B", rex::hid::kPadB},
+      {"X", rex::hid::kPadX},
+      {"Y", rex::hid::kPadY},
+      {"LB", rex::hid::kPadLeftShoulder},
+      {"RB", rex::hid::kPadRightShoulder},
+      {"Back", rex::hid::kPadBack},
+      {"Start", rex::hid::kPadStart},
+      {"LS", rex::hid::kPadLeftThumb},
+      {"RS", rex::hid::kPadRightThumb},
+      {"Up", rex::hid::kPadDPadUp},
+      {"Down", rex::hid::kPadDPadDown},
+      {"Left", rex::hid::kPadDPadLeft},
+      {"Right", rex::hid::kPadDPadRight},
+  };
+  auto find = [](std::string_view name) -> u16 {
+    while (!name.empty() && name.front() == ' ') {
+      name.remove_prefix(1);
+    }
+    while (!name.empty() && name.back() == ' ') {
+      name.remove_suffix(1);
+    }
+    for (const Name& entry : kNames) {
+      if (entry.name.size() == name.size() &&
+          std::equal(name.begin(), name.end(), entry.name.begin(),
+                     [](char a, char b) { return std::tolower(a) == std::tolower(b); })) {
+        return entry.bit;
+      }
+    }
+    return 0;
+  };
+  PadRemap remap;
+  for (u32 i = 0; i < remap.size(); ++i) {
+    remap[i] = static_cast<u16>(1u << i);
+  }
+  while (!text.empty()) {
+    const size_t comma = text.find(',');
+    const std::string_view pair = text.substr(0, comma);
+    text = comma == std::string_view::npos ? std::string_view() : text.substr(comma + 1);
+    const size_t equals = pair.find('=');
+    if (equals == std::string_view::npos) {
+      continue;
+    }
+    const u16 from = find(pair.substr(0, equals));
+    const u16 to = find(pair.substr(equals + 1));
+    if (from && to) {
+      remap[std::countr_zero(from)] = to;
+    }
+  }
+  return remap;
+}
+
+u16 RemapButtons(u16 buttons, const PadRemap& remap) {
+  u16 out = 0;
+  for (u32 i = 0; i < remap.size(); ++i) {
+    if (buttons & (1u << i)) {
+      out = static_cast<u16>(out | remap[i]);
+    }
+  }
+  return out;
 }
 
 void ApplyDeadzones(rex::hid::PadState& state, f64 left, f64 right) {

@@ -11,6 +11,7 @@ add_executable(
   hid/sdl3_input_test.cpp
   hid/bindings_test.cpp
   hid/input_source_test.cpp
+  hid/pad_remap_test.cpp
   hid/key_capture_test.cpp
   hid/key_chord_test.cpp
   hid/virtual_key_test.cpp

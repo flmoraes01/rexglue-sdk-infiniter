@@ -1222,6 +1222,7 @@ bool DlssPass::DispatchFsr(ID3D12GraphicsCommandList* command_list, const Inputs
   (void)command_list;
   (void)inputs;
   (void)color;
+  (void)reactive;
   return false;
 #endif
 }

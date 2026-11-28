@@ -75,6 +75,9 @@ struct InputSystem::State {
   std::array<detail::KeystrokeSynth, detail::kMaxUsers> synth;
   std::array<bool, detail::kMaxUsers> connected{};
   std::array<u16, detail::kMaxUsers> consumed{};
+  // InputSettings::pad_remap, parsed when its text changes.
+  std::string pad_remap_text;
+  detail::PadRemap pad_remap = detail::ParsePadRemap("");
   std::array<u32, detail::kMaxUsers> packet{};
   std::array<rex::hid::PadState, detail::kMaxUsers> last_state{};
   std::array<u64, detail::kMaxUsers> last_signature{};
@@ -246,6 +249,13 @@ Result<InputSystem::PadReading> InputSystem::State::ReadUserLocked(u32 user) {
     return std::unexpected(raw.error());
   }
   rex::hid::PadState state = *raw;
+  // The title sees remapped buttons; the UI keeps the physical ones (ReadPadForUI).
+  if (const std::string remap_text = owner.GetSettings().pad_remap.Get();
+      remap_text != pad_remap_text) {
+    pad_remap_text = remap_text;
+    pad_remap = detail::ParsePadRemap(remap_text);
+  }
+  state.buttons = detail::RemapButtons(state.buttons, pad_remap);
   if (ui_blocks.load() > 0) {
     state = {};
   } else if (consumed[user] != 0) {

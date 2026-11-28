@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <rex/input_keys.h>
@@ -85,6 +86,20 @@ bool IsNeutral(const rex::hid::PadState& state);
  * @param right The right stick deadzone, 0 to 1.
  */
 void ApplyDeadzones(rex::hid::PadState& state, f64 left, f64 right);
+
+/** For each button bit, the bits it sends instead (identity when not remapped). */
+using PadRemap = std::array<u16, 16>;
+
+/**
+ * Parses InputSettings::pad_remap: comma separated FROM=TO pairs of button names. Unknown names
+ * and malformed pairs are skipped.
+ *
+ * @return The remap, identity for an empty text.
+ */
+PadRemap ParsePadRemap(std::string_view text);
+
+/** Returns the buttons as the remap sends them. */
+u16 RemapButtons(u16 buttons, const PadRemap& remap);
 
 /**
  * Returns whether two devices are one physical pad. Two devices are one pad when both have the same
