@@ -90,12 +90,15 @@ class DlssPass {
       f32 local_structure = 1.0f;
       f32 local_tone = 1.0f;
       f32 skin_structure = -1.0f;  // -1 leaves the model's own value
+      f32 resolution = 1.0f;       // the model's resolution over the frame's, 1/3 to 1
       bool operator==(const NeuralRendering&) const = default;
     } nr;
     // How the model's answer is composed with the frame (not latched).
     f32 nr_detail_strength = 1.0f;
     f32 nr_colour_strength = 1.0f;
     u32 nr_debug_view = 0;  // 0 composed, 1 amplified difference, 2 the model's raw answer
+    // HDR correction around the model on a linear HDR chain: 0 clip, 1 soft knee, 2 hybrid.
+    u32 nr_hdr_mode = 2;
   };
 
   DlssPass() = default;
@@ -173,8 +176,16 @@ class DlssPass {
                        u32 height);
   bool EvaluateNr(ID3D12GraphicsCommandList* command_list, const Inputs& inputs,
                   ID3D12Resource* color, u32 color_x, u32 color_y, u32 width, u32 height);
-  void Compose(ID3D12GraphicsCommandList* command_list, const Inputs& inputs, u32 original_slot,
-               u32 original_x, u32 original_y, u32 width, u32 height);
+  // The model's size for a frame of width x height (Inputs::NeuralRendering::resolution).
+  static void NrModelSize(const Inputs& inputs, u32 width, u32 height, u32& model_width,
+                          u32& model_height);
+  // Prepares the frame in kSlotNrComposeSRV for the model into nr_in_ (HDR correction, model
+  // resolution).
+  void PrepareNr(ID3D12GraphicsCommandList* command_list, const Inputs& inputs, u32 x, u32 y,
+                 u32 width, u32 height, u32 model_width, u32 model_height, bool hdr_chain);
+  void Compose(ID3D12GraphicsCommandList* command_list, const Inputs& inputs, u32 original_x,
+               u32 original_y, u32 width, u32 height, u32 model_width, u32 model_height,
+               bool hdr_chain);
   void AgeRetiredFeatures(bool release_all);
   void Sharpen(ID3D12GraphicsCommandList* command_list, f32 sharpness, u32 source_slot,
                u32 source_x, u32 source_y, u32 width, u32 height);
@@ -193,6 +204,11 @@ class DlssPass {
     kSlotMotionOutUAV,
     kSlotSceneSRV,     // compose: the scene render target as the frame the model was given
     kSlotColorOutSRV,  // compose: DLSS's output as the frame the model was given
+    kSlotNrComposeSRV,  // NR prepare and compose: t0 the frame, t1 the model's input, t2 its answer
+    kSlotNrInSRV,
+    kSlotNrModelSRV,
+    kSlotNrInUAV,       // NR prepare: u0 (u1, u2 unused)
+    kSlotNrInUAVSpare,
     kSlotNrOutUAV,     // compose: u0, u1 (u1 unused)
     kSlotStatsUAV,     // compose: u1, the statistics buffer
     kSlotSmaaColorSRV,   // SMAA: t0 of edges and blending (contiguous with the next)
@@ -238,6 +254,7 @@ class DlssPass {
   Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> inputs_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> compose_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> nr_prepare_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> cas_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> scale_pipeline_;
   // The scene as linear float (Inputs::color_scale above 1), and the result back in the scene's
@@ -274,6 +291,9 @@ class DlssPass {
   Microsoft::WRL::ComPtr<ID3D12Resource> depth_out_;
   Microsoft::WRL::ComPtr<ID3D12Resource> motion_out_;
   Microsoft::WRL::ComPtr<ID3D12Resource> nr_out_;
+  // Neural Rendering's input (the prepared frame) and answer, sRGB 8-bit at the model resolution.
+  Microsoft::WRL::ComPtr<ID3D12Resource> nr_in_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> nr_model_;
   Microsoft::WRL::ComPtr<ID3D12Resource> sharpen_out_;
   // Copies of depth and motion for frame generation, so the presenter never reads a pair the
   // next frame is overwriting.

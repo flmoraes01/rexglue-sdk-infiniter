@@ -20,6 +20,7 @@
 #include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/dlss_motion_copy_cs.h"
 #include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/dlss_motion_debug_cs.h"
 #include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/dlss_nr_compose_cs.h"
+#include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/dlss_nr_prepare_cs.h"
 #include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/smaa_blend_cs.h"
 #include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/ssgi_cs.h"
 #include "gpu/xenos/d3d12/shaders/bytecode/d3d12_5_1/smaa_edges_cs.h"
@@ -153,6 +154,9 @@ bool DlssPass::Initialize(ID3D12Device* device) {
   compose_pipeline_.Attach(objects::CreateComputePipeline(device, kDlssNrComposeCS,
                                                           sizeof(kDlssNrComposeCS),
                                                           root_signature_.Get()));
+  nr_prepare_pipeline_.Attach(objects::CreateComputePipeline(device, kDlssNrPrepareCS,
+                                                             sizeof(kDlssNrPrepareCS),
+                                                             root_signature_.Get()));
   cas_pipeline_.Attach(objects::CreateComputePipeline(device, kCasCS, sizeof(kCasCS),
                                                       root_signature_.Get()));
   scale_pipeline_.Attach(objects::CreateComputePipeline(device, kDlssColorScaleCS,
@@ -408,6 +412,9 @@ void DlssPass::Shutdown() {
   heap_.Reset();
   inputs_pipeline_.Reset();
   compose_pipeline_.Reset();
+  nr_prepare_pipeline_.Reset();
+  nr_in_.Reset();
+  nr_model_.Reset();
   root_signature_.Reset();
 }
 
@@ -554,7 +561,7 @@ bool DlssPass::EvaluateNr(ID3D12GraphicsCommandList* command_list, const Inputs&
   SetParameterResource("DLSSNR.Color", color);
   SetParameterResource("DLSSNR.Depth", depth_out_.Get());
   SetParameterResource("DLSSNR.MVec", motion_out_.Get());
-  SetParameterResource("DLSSNR.Output", nr_out_.Get());
+  SetParameterResource("DLSSNR.Output", nr_model_.Get());
   // The block is shared with DLSS, so everything the model reads is written again every time.
   SetParameterU32("DLSSNR.Enabled", 1);
   SetParameterU32("DLSSNR.Width", width);
@@ -708,27 +715,62 @@ void DlssPass::ScaleColor(ID3D12GraphicsCommandList* command_list, u32 source_sl
   command_list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
 }
 
-void DlssPass::Compose(ID3D12GraphicsCommandList* command_list, const Inputs& inputs,
-                       u32 original_slot, u32 original_x, u32 original_y, u32 width, u32 height) {
+void DlssPass::NrModelSize(const Inputs& inputs, u32 width, u32 height, u32& model_width,
+                           u32& model_height) {
+  const f32 resolution = std::clamp(inputs.nr.resolution, 1.0f / 3.0f, 1.0f);
+  model_width = std::max(8u, static_cast<u32>(std::lround(width * resolution)));
+  model_height = std::max(8u, static_cast<u32>(std::lround(height * resolution)));
+}
+
+void DlssPass::PrepareNr(ID3D12GraphicsCommandList* command_list, const Inputs& inputs, u32 x,
+                         u32 y, u32 width, u32 height, u32 model_width, u32 model_height,
+                         bool hdr_chain) {
   struct {
     u32 origin[2];
     u32 size[2];
+    u32 model_size[2];
+    u32 hdr_chain;
+    u32 hdr_mode;
+  } constants = {{x, y}, {width, height}, {model_width, model_height}, hdr_chain ? 1u : 0u,
+                 inputs.nr_hdr_mode};
+  ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
+  command_list->SetDescriptorHeaps(1, heaps);
+  command_list->SetComputeRootSignature(root_signature_.Get());
+  command_list->SetPipelineState(nr_prepare_pipeline_.Get());
+  command_list->SetComputeRoot32BitConstants(0, sizeof(constants) / sizeof(u32), &constants, 0);
+  command_list->SetComputeRootDescriptorTable(1, GpuDescriptor(kSlotNrComposeSRV));
+  command_list->SetComputeRootDescriptorTable(2, GpuDescriptor(kSlotNrInUAV));
+  command_list->Dispatch((model_width + 7) / 8, (model_height + 7) / 8, 1);
+}
+
+void DlssPass::Compose(ID3D12GraphicsCommandList* command_list, const Inputs& inputs,
+                       u32 original_x, u32 original_y, u32 width, u32 height, u32 model_width,
+                       u32 model_height, bool hdr_chain) {
+  struct {
+    u32 origin[2];
+    u32 size[2];
+    u32 model_size[2];
     f32 detail_strength;
     f32 colour_strength;
     f32 max_ratio;
     u32 debug_view;
+    u32 hdr_chain;
+    u32 hdr_mode;
   } constants = {{original_x, original_y},
                  {width, height},
+                 {model_width, model_height},
                  inputs.nr_detail_strength,
                  inputs.nr_colour_strength,
                  4.0f,
-                 inputs.nr_debug_view};
+                 inputs.nr_debug_view,
+                 hdr_chain ? 1u : 0u,
+                 inputs.nr_hdr_mode};
   ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
   command_list->SetDescriptorHeaps(1, heaps);
   command_list->SetComputeRootSignature(root_signature_.Get());
   command_list->SetPipelineState(compose_pipeline_.Get());
   command_list->SetComputeRoot32BitConstants(0, sizeof(constants) / sizeof(u32), &constants, 0);
-  command_list->SetComputeRootDescriptorTable(1, GpuDescriptor(original_slot));
+  command_list->SetComputeRootDescriptorTable(1, GpuDescriptor(kSlotNrComposeSRV));
   command_list->SetComputeRootDescriptorTable(2, GpuDescriptor(kSlotNrOutUAV));
   command_list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
 }
@@ -1058,6 +1100,8 @@ bool DlssPass::EnsureTextures(const Inputs& inputs, DXGI_FORMAT chain_format,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&out)));
   };
   if (!create(chain_format, color_out_) || !create(chain_format, nr_out_) ||
+      !create(DXGI_FORMAT_R8G8B8A8_UNORM, nr_in_) ||
+      !create(DXGI_FORMAT_R8G8B8A8_UNORM, nr_model_) ||
       !create(DXGI_FORMAT_R32_FLOAT, depth_out_) ||
       !create(DXGI_FORMAT_R16G16_FLOAT, motion_out_) ||
       !create(chain_format, smaa_color_) || !create(DXGI_FORMAT_R8G8_UNORM, smaa_edges_) ||
@@ -1085,6 +1129,11 @@ bool DlssPass::EnsureTextures(const Inputs& inputs, DXGI_FORMAT chain_format,
   device_->CreateUnorderedAccessView(color_out_.Get(), nullptr, nullptr,
                                      CpuDescriptor(kSlotColorOutUAV));
   device_->CreateShaderResourceView(nr_out_.Get(), nullptr, CpuDescriptor(kSlotNrOutSRV));
+  device_->CreateShaderResourceView(nr_in_.Get(), nullptr, CpuDescriptor(kSlotNrInSRV));
+  device_->CreateShaderResourceView(nr_model_.Get(), nullptr, CpuDescriptor(kSlotNrModelSRV));
+  for (u32 slot : {kSlotNrInUAV, kSlotNrInUAVSpare}) {
+    device_->CreateUnorderedAccessView(nr_in_.Get(), nullptr, nullptr, CpuDescriptor(slot));
+  }
   device_->CreateUnorderedAccessView(gi_out_.Get(), nullptr, nullptr, CpuDescriptor(kSlotGiOutUAV));
   device_->CreateShaderResourceView(gi_out_.Get(), nullptr, CpuDescriptor(kSlotGiOutSRV));
   device_->CreateUnorderedAccessView(sharpen_out_.Get(), nullptr, nullptr,
@@ -1334,7 +1383,10 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
   const bool nr_before = nr && (inputs.nr.before_dlss || (!dlss && !fsr && !smaa));
   const u32 nr_width = nr_before ? inputs.render_width : inputs.width;
   const u32 nr_height = nr_before ? inputs.render_height : inputs.height;
-  const bool run_nr = nr && EnsureNrFeature(command_list, inputs, nr_width, nr_height);
+  u32 nr_model_width = 0, nr_model_height = 0;
+  NrModelSize(inputs, nr_width, nr_height, nr_model_width, nr_model_height);
+  const bool run_nr =
+      nr && EnsureNrFeature(command_list, inputs, nr_model_width, nr_model_height);
 
   // This frame's views of the scene targets.
   D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
@@ -1460,18 +1512,40 @@ void DlssPass::Record(ID3D12GraphicsCommandList* command_list, const Inputs& inp
   bool nr_out_read = false;
   bool color_out_read = false;
   auto run_nr_step = [&](u32 width, u32 height) {
-    if (!EvaluateNr(command_list, inputs, current, current_x, current_y, width, height)) {
+    if (!EnsureStatsBuffers()) {
       return;
     }
-    // The model wrote nr_out_; compose it with the frame it was given, in place.
+    // The frame, its preparation for the model (HDR correction, model resolution), the model.
+    u32 model_width = 0, model_height = 0;
+    NrModelSize(inputs, width, height, model_width, model_height);
+    const DXGI_FORMAT frame_format = TypedColorFormat(current->GetDesc().Format);
+    const bool hdr_chain = frame_format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+    D3D12_SHADER_RESOURCE_VIEW_DESC frame_srv = {};
+    frame_srv.Format = frame_format;
+    frame_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    frame_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    frame_srv.Texture2D.MipLevels = 1;
+    device_->CreateShaderResourceView(current, &frame_srv, CpuDescriptor(kSlotNrComposeSRV));
+    PrepareNr(command_list, inputs, current_x, current_y, width, height, model_width,
+              model_height, hdr_chain);
+    barriers.Add(nr_in_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kShaderRead);
+    barriers.Submit(command_list);
+    if (!EvaluateNr(command_list, inputs, nr_in_.Get(), 0, 0, model_width, model_height)) {
+      barriers.Add(nr_in_.Get(), kShaderRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      barriers.Submit(command_list);
+      return;
+    }
+    // The model wrote nr_model_; compose it with the frame into nr_out_.
+    barriers.Add(nr_model_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kShaderRead);
+    barriers.Submit(command_list);
+    Compose(command_list, inputs, current_x, current_y, width, height, model_width, model_height,
+            hdr_chain);
+    barriers.Add(nr_in_.Get(), kShaderRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    barriers.Add(nr_model_.Get(), kShaderRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     D3D12_RESOURCE_BARRIER uav = {};
     uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     uav.UAV.pResource = nr_out_.Get();
     command_list->ResourceBarrier(1, &uav);
-    if (!EnsureStatsBuffers()) {
-      return;
-    }
-    Compose(command_list, inputs, current_slot, current_x, current_y, width, height);
     D3D12_RESOURCE_BARRIER stats_uav = {};
     stats_uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     stats_uav.UAV.pResource = stats_.Get();

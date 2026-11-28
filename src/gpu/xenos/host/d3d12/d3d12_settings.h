@@ -78,7 +78,8 @@ class D3D12Settings : public SettingOwner {
   REX_SETTING(std::string, dlss, "off",
               "Scene anti-aliasing: off, smaa (any GPU), dlaa (NVIDIA, native resolution), or DLSS "
               "super resolution "
-              "from a smaller scene: quality (67%), balanced (58%), performance (50%); needs an "
+              "from a smaller scene: quality (67%), balanced (58%), performance (50%), "
+              "ultra_performance (33%); needs an "
               "RTX GPU and nvngx_dlss.dll next to the executable");
   REX_SETTING(std::string, dlss_preset, "default",
               "DLSS model: default, cnn (the convolutional model), or transformer preset J, K, L "
@@ -123,6 +124,13 @@ class D3D12Settings : public SettingOwner {
   REX_SETTING(f64, dlss_nr_detail_strength, 1.5,
               "How much of the model's change in light is kept: 1 as the model gives it, higher "
               "amplifies it", Range{0.0, 4.0});
+  REX_SETTING(f64, dlss_nr_resolution, 1.0,
+              "Neural Rendering model resolution over the frame's: below 1 the model runs on a "
+              "smaller copy and only its change is enlarged onto the frame", Range{1.0 / 3.0, 1.0});
+  REX_SETTING(std::string, dlss_nr_hdr_correction, "hybrid",
+              "How a linear HDR chain is brought into the model's SDR range and back: off (clip "
+              "above 1), soft (soft knee on every value) or hybrid (unchanged midtones, soft "
+              "highlights)");
   REX_SETTING(f64, dlss_nr_colour_strength, 1.0,
               "How much of the model's colour is taken: 0 keeps the game's colour", Range{0.0, 1.0});
   REX_SETTING(std::string, dlss_nr_debug, "off",

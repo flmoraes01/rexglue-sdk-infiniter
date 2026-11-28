@@ -3410,7 +3410,8 @@ std::array<f32, 16> MultiplyMatrix4(const std::array<f32, 16>& a, const std::arr
 
 D3D12CommandProcessor::DlssMode D3D12CommandProcessor::GetDlssMode() const {
   const std::string& mode = GetD3D12Settings().dlss.Get();
-  // NVSDK_NGX_PerfQuality_Value: 0 MaxPerf, 1 Balanced, 2 MaxQuality, 5 DLAA.
+  // NVSDK_NGX_PerfQuality_Value: 0 MaxPerf, 1 Balanced, 2 MaxQuality, 3 UltraPerformance,
+  // 5 DLAA.
   if (mode == "dlaa") {
     return {true, 5, 1.0f};
   }
@@ -3422,6 +3423,9 @@ D3D12CommandProcessor::DlssMode D3D12CommandProcessor::GetDlssMode() const {
   }
   if (mode == "performance") {
     return {true, 0, 0.5f};
+  }
+  if (mode == "ultra_performance") {
+    return {true, 3, 1.0f / 3.0f};
   }
   if (mode == "smaa") {
     return {false, 5, 1.0f, true};
@@ -4021,6 +4025,9 @@ void D3D12CommandProcessor::RecordDlssCall(std::unique_ptr<DlssCall> call) {
   inputs.nr.local_structure = static_cast<f32>(settings.dlss_nr_local_structure.Get());
   inputs.nr.local_tone = static_cast<f32>(settings.dlss_nr_local_tone.Get());
   inputs.nr.skin_structure = static_cast<f32>(settings.dlss_nr_skin_structure.Get());
+  inputs.nr.resolution = static_cast<f32>(settings.dlss_nr_resolution.Get());
+  const std::string& hdr = settings.dlss_nr_hdr_correction.Get();
+  inputs.nr_hdr_mode = hdr == "off" ? 0 : hdr == "soft" ? 1 : 2;
   deferred_command_list_.HostCall(&DlssHostCall, call.get());
   dlss_calls_.push_back(std::move(call));
   InvalidateCommandListState();
