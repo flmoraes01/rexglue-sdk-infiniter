@@ -28,6 +28,10 @@ class XenosSettings : public SettingOwner {
               "Without gpu.vsync, deliver guest vblanks every 1 ms instead of at the video mode "
               "refresh rate. Turn off for titles that count vblanks as time");
   REX_SETTING(bool, present_allow_overscan_cutoff, false, "Allow cutting off overscan");
+  REX_SETTING(bool, upload_prefetch, true,
+              "When a draw needs guest memory uploaded, also upload the pages uploaded two frames "
+              "ago that the CPU has rewritten: one buffer transition for the frame's dynamic "
+              "data instead of one per draw");
   REX_SETTING(std::string, readback_resolve, "none",
               "Controls CPU readback of render to texture resolve results",
               Allowed("none", "fast", "some", "full"));

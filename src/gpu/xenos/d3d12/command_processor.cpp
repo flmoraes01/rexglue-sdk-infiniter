@@ -1833,6 +1833,7 @@ void D3D12CommandProcessor::IssueSwap([[maybe_unused]] u32 frontbuffer_ptr, u32 
                                                frontbuffer_height);
   }
   EndDlssFrame(frontbuffer_width, frontbuffer_height);
+  shared_memory_->EndFrameUploads(GetXenosSettings().upload_prefetch.Get());
   gpu::Presenter* presenter = graphics_system_->GetHostPresenter();
   if (!presenter) {
     REXGPU_ERROR("IssueSwap: presenter is null");

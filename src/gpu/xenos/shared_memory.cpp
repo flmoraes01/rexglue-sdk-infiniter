@@ -37,6 +37,9 @@ void SharedMemory::InitializeCommon() {
   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
   system_page_flags_valid_.assign(num_system_page_flags_, 0);
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
+  for (std::vector<u64>& pages : uploaded_pages_) {
+    pages.assign(num_system_page_flags_, 0);
+  }
 
   write_listener_ = write_watch_.AddWriteListener(*this);
   write_listener_registered_ = true;
@@ -441,8 +444,71 @@ bool SharedMemory::RequestRanges(const std::pair<u32, u32>* ranges, size_t count
   if (upload_ranges_.empty()) {
     return true;
   }
+  AddUploadPrefetch();
 
   return UploadRanges(upload_ranges_);
+}
+
+void SharedMemory::AddUploadPrefetch() {
+  std::vector<u64>& current = uploaded_pages_[upload_frame_];
+  std::vector<u32>& current_blocks = uploaded_blocks_[upload_frame_];
+  if (current.empty()) {
+    return;
+  }
+  auto mark = [&](u32 page_start, u32 page_count) {
+    for (u32 page = page_start; page < page_start + page_count; ++page) {
+      u64& block = current[page >> 6];
+      if (!block) {
+        current_blocks.push_back(page >> 6);
+      }
+      block |= u64(1) << (page & 63);
+    }
+  };
+  const size_t requested = upload_ranges_.size();
+  for (size_t i = 0; i < requested; ++i) {
+    mark(upload_ranges_[i].first, upload_ranges_[i].second);
+  }
+  if (!upload_prefetch_) {
+    return;
+  }
+  // The pages uploaded two frames ago that the CPU has rewritten since. The requested ones are
+  // already in upload_ranges_ and in current, which add_block skips.
+  auto lock = AcquireLock();
+  auto add_block = [&](u32 block_index, u64 bits) {
+    bits &= ~system_page_flags_valid_[block_index];
+    bits &= ~current[block_index];
+    while (bits) {
+      u32 first;
+      rex::bit_scan_forward(bits, &first);
+      const u64 run = bits >> first;
+      const u32 count = run == (UINT64_MAX >> first) ? 64 - first : rex::tzcnt(~run);
+      upload_ranges_.emplace_back((block_index << 6) + first, count);
+      mark((block_index << 6) + first, count);
+      bits &= ~current[block_index];
+    }
+  };
+  // Two frames back, not one: with double-buffered dynamic data the CPU is rewriting the previous
+  // frame's buffers for the next frame while this one is drawn, and uploading them now would only
+  // be redone. Pages rewritten every frame are in that set as well.
+  const u32 frame = (upload_frame_ + 1) % 3;
+  for (u32 block_index : uploaded_blocks_[frame]) {
+    add_block(block_index, uploaded_pages_[frame][block_index]);
+  }
+  std::sort(upload_ranges_.begin(), upload_ranges_.end());
+}
+
+void SharedMemory::EndFrameUploads(bool prefetch) {
+  upload_prefetch_ = prefetch;
+  // A frame that uploaded nothing (a loading screen) does not push the older sets out.
+  if (uploaded_blocks_[upload_frame_].empty()) {
+    return;
+  }
+  upload_frame_ = (upload_frame_ + 1) % 3;
+  std::vector<u64>& pages = uploaded_pages_[upload_frame_];
+  for (u32 block_index : uploaded_blocks_[upload_frame_]) {
+    pages[block_index] = 0;
+  }
+  uploaded_blocks_[upload_frame_].clear();
 }
 
 bool SharedMemory::RequestRange(u32 start, u32 length) {
